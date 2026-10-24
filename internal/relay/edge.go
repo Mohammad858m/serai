@@ -454,12 +454,6 @@ func (s *session) bind(ctx context.Context, f protocol.Forward) (*protocol.Accep
 		return nil, &protocol.Rejected{Name: f.Name, Ports: ports, Reason: reason}
 	}
 
-	for _, p := range f.Ports {
-		if !config.PortAllowed(e.cfg.Server.AllowPorts, p) {
-			return reject(fmt.Sprintf("port %d is outside server.allow_ports", p), []int{p})
-		}
-	}
-
 	controlPort := portOf(e.cfg.Server.ControlAddr)
 	quicPort := portOf(e.cfg.Server.QUICAddr)
 
@@ -467,12 +461,23 @@ func (s *session) bind(ctx context.Context, f protocol.Forward) (*protocol.Accep
 	for _, p := range f.Ports {
 		// The shared port cannot be bound twice. With an SNI it needs no
 		// listener at all; without one there is nothing to demultiplex on.
+		//
+		// allow_ports exists to limit which ports an origin can make this
+		// relay open. Serving the relay's own port by SNI opens nothing, so
+		// it is exempt -- otherwise the common case of one rule on 443 would
+		// need 443 listed in allow_ports, which reads like permission to
+		// rebind the relay's own listener.
 		if p == controlPort {
 			if len(f.SNI) == 0 {
 				return reject(fmt.Sprintf("port %d is the relay's own port; give this rule an \"sni\" so it can share it", p), []int{p})
 			}
 			bound = append(bound, p)
 			continue
+		}
+
+		if !config.PortAllowed(e.cfg.Server.AllowPorts, p) {
+			return reject(fmt.Sprintf("port %d is outside server.allow_ports (%s)",
+				p, e.cfg.Server.AllowPorts), []int{p})
 		}
 		if f.WantsTCP() {
 			if err := s.listenTCP(ctx, f.Name, p); err != nil {

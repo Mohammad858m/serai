@@ -152,6 +152,23 @@ build_binary() {
     src="$(mktemp -d)"
     spin "fetching source" git clone --depth 1 "$REPO_URL" "$src"
   fi
+  # Resolve modules before building: "go build" will not write go.sum entries
+  # on its own, and the repository ships without a go.sum.
+  #
+  # proxy.golang.org is served by Google and is not reachable from every
+  # network — notably not from inside Iran, which is exactly where the relay
+  # runs. The list falls through to mirrors and then to direct VCS fetches.
+  export GOTOOLCHAIN=local
+  export GOPROXY="${SERAI_GOPROXY:-https://proxy.golang.org,https://goproxy.io,https://goproxy.cn,direct}"
+
+  if ! spin "resolving dependencies" bash -c "cd '$src' && GOFLAGS=-mod=mod go mod tidy"; then
+    warn "could not fetch modules from any proxy"
+    warn "if this network blocks them, either set a reachable mirror:"
+    warn "    SERAI_GOPROXY=https://your-mirror,direct bash $0 ${1:-}"
+    warn "or build on the other server and copy the binary to $BIN"
+    return 1
+  fi
+
   spin "building serai (static, stripped)" bash -c "
     cd '$src' &&
     GOFLAGS=-trimpath CGO_ENABLED=0 go build \
@@ -368,7 +385,17 @@ install_edge() {
   ask DECOY    "decoy site to mirror for probers" "https://www.lipsum.com"
   ask WSPATH   "websocket path" "/$(head -c 8 /dev/urandom | base64 | tr -dc 'a-z0-9' | head -c 8)"
   ask PROFILE  "profile (speed / balanced / stealth)" "balanced"
-  ask ALLOW    "ports an origin may claim" "443,8000-9000,10000-20000"
+  printf '\n'
+  info "the next answer limits which ports an origin may make this relay"
+  info "open. Every inbound port you forward has to fall inside it, so keep"
+  info "it a range, not a single port. 443 is served by SNI and needs no"
+  info "entry. You can widen it later in $CONF_DIR/edge.json."
+  ask ALLOW    "port range an origin may open (ranges ok)" "8000-9000,10000-20000"
+  if [[ "$ALLOW" != *-* && "$ALLOW" != *,* ]]; then
+    warn "'$ALLOW' is a single port — the origin will only be able to forward"
+    warn "that one port, and anything else it asks for will be refused"
+    confirm "keep it anyway?" || ask ALLOW "port range an origin may open" "8000-9000,10000-20000"
+  fi
 
   ensure_go; build_binary
   obtain_cert "$DOMAIN"
@@ -423,6 +450,7 @@ CONF
   rule
   kv "domain"        "$DOMAIN"
   kv "websocket path" "$WSPATH"
+  kv "allowed ports"  "$ALLOW  (plus 443 via SNI)"
   kv "pre-shared key" "$psk"
   kv "certificate pin" "$pin"
   rule
