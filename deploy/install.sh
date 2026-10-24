@@ -163,6 +163,44 @@ confirm() {
 # ───────────────────────────────────────────────────────────── environment ────
 need_root() { [[ $EUID -eq 0 ]] || die "run as root (try: sudo bash $0)"; }
 
+# public_ip reports this host's reachable address.
+#
+# It reads the kernel's own source address for an off-network route first, which
+# is correct on a VPS with a public address attached directly and needs no
+# outbound request at all. That matters here: the relay often sits on a network
+# where the usual echo services are unreachable, and falling straight to curl
+# left the installer printing a placeholder where the operator needed a number
+# to paste into the other half.
+public_ip() {
+  local ip svc
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p')"
+  if [[ -n "$ip" ]] && ! is_private "$ip"; then
+    printf '%s' "$ip"
+    return
+  fi
+
+  # Behind NAT the local address says nothing, so ask -- several of them,
+  # because any single service may be blocked from here.
+  for svc in https://api.ipify.org https://ifconfig.me https://icanhazip.com https://ipinfo.io/ip; do
+    ip="$(curl -fsS --max-time 4 "$svc" 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s' "$ip"
+      return
+    fi
+  done
+
+  printf '%s' "${1:-<this host IP>}"
+}
+
+is_private() {
+  case "$1" in
+    10.*|127.*|169.254.*|192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 detect_os() {
   [[ -r /etc/os-release ]] || die "cannot read /etc/os-release"
   # shellcheck disable=SC1091
@@ -716,7 +754,7 @@ CONF
   printf '%s  Edge is live. Paste this into the origin installer.%s\n' "$C_BOLD$C_MINT" "$C_RESET"
   rule
   kv "tunnel name"    "$DOMAIN"
-  kv "relay address"  "$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || echo '<this host IP>')"
+  kv "relay address"  "$(public_ip):443"
   kv "websocket path" "$WSPATH"
   kv "allowed ports"  "$ALLOW  (plus 443 via SNI)"
   kv "pre-shared key" "$psk"
@@ -1030,7 +1068,7 @@ diagnose() {
 
   title "Diagnostics"
 
-  local myip; myip="$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || echo '?')"
+  local myip; myip="$(public_ip '?')"
   kv "public ip" "$myip"
 
   local sni; sni="$(json_field "$conf" tunnel_sni)"
