@@ -1,47 +1,58 @@
 # Serai
 
-تونل ریورس برای پنل‌های پروکسی (3x-ui، Marzban، Xray خام).
+A multipath reverse tunnel for panel-based proxies — 3x-ui, Marzban, bare Xray.
 
-سرور خارج به سرور ایران وصل می‌شه — نه برعکس. سرور ایران فقط یه کلید داره و یه پورت، و از بیرون شبیه یه وب‌سرور معمولیه.
+**English** · [فارسی](README.fa.md)
+
+The host that owns the panel dials the relay, not the other way round. The relay
+holds one key and one open port, and from the outside it looks like an ordinary
+web server.
 
 ```
-         کاربران                      ┌─ edge (ایران) ─┐        ┌─ origin (خارج) ─┐
-  ─── TLS سرتاسری ──────────────────► │  443/tcp+udp   │        │                  │
-      (تا Xray، edge بازش نمی‌کنه)    │  روتر SNI      │        │   3x-ui / Xray   │
+         users                         ┌─ edge (relay) ─┐        ┌─ origin ────────┐
+  ─── end-to-end TLS ─────────────────►│  443 tcp+udp   │        │                  │
+      (terminates at Xray, not here)   │  SNI router    │        │   3x-ui / Xray   │
                                        │                │◄───────┤   127.0.0.1:*    │
-                                       │  decoy site    │ تونل   │                  │
+                                       │  decoy site    │ tunnel │                  │
                                        └────────────────┘        └──────────────────┘
-                                                    ▲ origin شماره‌گیری می‌کنه
+                                                     ▲ the origin dials out
 ```
 
-**سرور خارج هیچ پورت بازی لازم نداره.** سرور ایران هیچ آدرس بک‌اندی نمی‌دونه — فقط نام قاعده رو نقل می‌کنه و origin از کانفیگ خودش مقصد رو حل می‌کنه.
+The origin needs no inbound firewall rule, no public port and no certificate.
+The relay knows no backend addresses: it quotes a rule *name* back, and the
+origin resolves the real target from its own config, so a seized relay cannot
+be told to connect anywhere it was not already allowed.
 
 ---
 
-## چرا IP سرور ایران بلاک می‌شه، و اینجا چه کاری می‌شه
+## Why relay addresses get blocked, and what this does about it
 
-بلاک شدن تقریباً هیچ‌وقت از شکستن رمزنگاری نمیاد. از این مسیرها میاد:
+Blocking almost never comes from breaking the encryption. It comes from these:
 
-| بردار شناسایی | واقعیت | کاری که Serai می‌کنه |
+| Detection vector | What actually happens | What Serai does |
 |---|---|---|
-| **فینگرپرینت TLS (JA3/JA4)** | `crypto/tls` گو یه ClientHello می‌سازه که هیچ مرورگری نمی‌سازه: ترتیب سایفر متفاوت، بدون GREASE، بدون ALPS. frp، chisel، rathole و فورک‌هاشون همه این رو لو می‌دن. | **uTLS** با ClientHello کروم/فایرفاکس روی مسیر WebSocket |
-| **ALPN سفارشی** | `mtnl/1` در ClientHello، حتی با شکل کروم، از یه Go hello ساده هم بدتره | وقتی fingerprint فعاله، فقط `h2, http/1.1` اعلام می‌شه و تونل روی WebSocket می‌ره |
-| **سرت self-signed روی 443** | خودش به‌تنهایی یه سیگناله | دامنه واقعی + Let's Encrypt؛ pinning فقط برای CA خصوصی |
-| **اکتیو-پروب** | رله‌ای که با RST یا TLS alert یا یه صفحه‌ی مصنوعی جواب بده، خودش رو معرفی کرده | **decoy**: ریورس‌پروکسی به یه سایت واقعی. احراز هویت ناموفق = سکوت کامل، بدون هیچ خطا |
-| **شکل ترافیک** | هارت‌بیت با سایز و فاصله‌ی ثابت، سکوت کامل در بیکاری، رشته‌ی طولانی رکوردهای هم‌اندازه | لایه **obfs**: تکه‌بندی تصادفی، پدینگ تصادفی، ترافیک پوششی با jitter |
-| **پورت‌های اسکن‌پذیر** | سروری با ۵۰ پورت عجیب باز، قبل از تحلیل هر کانکشنی پیدا می‌شه | **فقط 443** (tcp+udp). روتینگ با **SNI** بدون باز کردن TLS کاربر |
-| **طوفان ریکانکت** | حلقه‌ی تلاش هر ۱ ثانیه بعد از قطعی، تونل بودن رو تأیید می‌کنه | backoff نمایی با jitter، به‌ازای هر مسیر جداگانه |
+| **TLS fingerprint (JA3/JA4)** | Go's `crypto/tls` emits a ClientHello no browser produces: different cipher order, no GREASE, no ALPS. frp, chisel, rathole and most forks all carry this tell. | **uTLS** with a Chrome or Firefox ClientHello on the WebSocket path |
+| **Custom ALPN** | `mtnl/1` in a Chrome-shaped hello is a *stronger* signal than a plain Go one | when mimicry is on, only `h2, http/1.1` is offered and the tunnel rides a WebSocket |
+| **Self-signed cert on 443** | a signal all by itself | a real domain with a real certificate; pinning is for private CAs only |
+| **Active probing** | a relay that answers with a reset, a TLS alert or a synthetic page has identified itself | a **decoy** reverse proxy serving a real site; a failed MAC gets total silence, never an error |
+| **Traffic shape** | fixed-size heartbeats at a fixed interval, perfectly silent idle, long runs of identically sized records | an **obfs** layer: randomised chunking, random padding, jittered cover traffic |
+| **Scannable ports** | a host with fifty odd open ports is found long before any connection is analysed | **one port** (443 tcp+udp), with **SNI routing** that never opens the user's TLS |
+| **Reconnect storms** | a one-second retry loop after a cut confirms a tunnel | per-path exponential backoff with jitter |
 
-### بدون CDN
+### Without a CDN
 
-همه‌ی موارد بالا بدون CDN کار می‌کنن. ترکیب عملی:
+All of the above works with no CDN. The practical recipe:
 
-- دامنه روی IP ایران، **DNS-only** (در کلادفلر/آروان ابر خاکستری) — دامنه و سرت واقعی داری، پهنای‌باند CDN صفر
-- سرت Let's Encrypt
-- پروفایل `balanced` یا `stealth`
-- فقط 80 و 443 باز
+- a domain pointed at the relay's IP, **DNS-only** (grey cloud on Cloudflare or
+  ArvanCloud) — you get the name and the certificate, and pay nothing for CDN
+  bandwidth because traffic goes straight there
+- a Let's Encrypt certificate
+- profile `balanced` or `stealth`
+- only 80 and 443 reachable
 
-اگر خواستی CDN رو هم داشته باشی، معماری `role` اجازه می‌ده **فقط کانال کنترل** از CDN بره (چند کیلوبایت در ساعت) و دیتا مستقیم:
+If you do want a CDN in the mix, the `role` field lets the **control channel
+only** go through it — a few kilobytes an hour — while bulk traffic stays
+direct:
 
 ```json
 { "transport": "websocket", "url": "wss://link.example.com/ws",
@@ -50,33 +61,53 @@
 
 ---
 
-## راه‌اندازی
+## Install
 
-روی **سرور ایران**:
+On the **relay** (the host users will connect to):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Mohammad858m/serai/main/deploy/install.sh -o install.sh && sudo bash install.sh edge
 ```
 
-کلید و pin رو چاپ می‌کنه. روی **سرور خارج**:
+It prints a key and a certificate pin. Then on the **origin** (the host running
+the panel):
 
 ```bash
 sudo bash install.sh origin
 ```
 
-اسکریپت: Go رو نصب می‌کنه، بیلد می‌گیره، سرت می‌گیره، کانفیگ و یونیت systemd سخت‌شده می‌نویسه، فایروال رو به 80/443 محدود می‌کنه، و کرنل رو تیون می‌کنه (BBR + fq + بافرها + سقف fd).
+Run `sudo bash install.sh` with no argument for the full menu: status, logs,
+pairing details, diagnostics, config editing, updates and key rotation.
 
-بیلد دستی:
+The installer fetches Go if needed, builds, obtains a certificate, writes a
+hardened systemd unit, narrows the firewall to 80 and 443, and tunes the kernel
+(BBR, fq, socket buffers, descriptor limits).
+
+Building by hand:
 
 ```bash
 go mod tidy && go build -trimpath -ldflags "-s -w" -o serai ./cmd/serai
 ```
 
+### DNS
+
+Two names, both pointed at the **relay's** IP, both DNS-only:
+
+| Name | Purpose |
+|---|---|
+| `tun.example.com` | the tunnel itself, its certificate, and the decoy site |
+| `vpn.example.com` | user traffic, routed by SNI on the same 443 |
+
+They are separate on purpose: TLS for `tun` terminates on the relay, while
+`vpn` is forwarded untouched to Xray on the origin, so the relay never sees
+user content.
+
 ---
 
-## اتصال به 3x-ui
+## Using it with 3x-ui
 
-قواعد فوروارد در کانفیگ **origin** (همون سروری که پنل روشه) زندگی می‌کنن:
+Forwarding rules live in the **origin** config, on the host that already runs
+the panel:
 
 ```json
 "forwards": [
@@ -98,152 +129,182 @@ go mod tidy && go build -trimpath -ldflags "-s -w" -o serai ./cmd/serai
 ]
 ```
 
-- `edge_ports` رِنج قبول می‌کنه. اینباند جدید روی ۲۰۰۰۱ اضافه کن — بدون تغییر هیچ‌طرفی کار می‌کنه.
-- `target_host` یعنی همون پورت سمت مقصد: edge:20001 → 127.0.0.1:20001.
-- `sni` اجازه می‌ده قاعده روی 443 مشترک با خود تونل بنشینه، پس فقط یک پورت باز می‌مونه.
-- `proxy_protocol: 2` + `acceptProxyProtocol: true` روی اینباند ⇒ پنل **IP واقعی کاربر** رو می‌بینه، نه 127.0.0.1. بدون این، محدودیت per-IP و روتینگ GeoIP بی‌معنی می‌شن.
+- `edge_ports` takes ranges. Add an inbound on 20001 in the panel and it is
+  already reachable, with no change on either server.
+- `target_host` keeps the port: edge:20001 → 127.0.0.1:20001.
+- `sni` lets a rule share 443 with the tunnel, which is what keeps the relay
+  down to a single open port.
+- `proxy_protocol: 2` plus `acceptProxyProtocol: true` on the inbound means the
+  panel logs the **real client IP** instead of 127.0.0.1. Without it, per-IP
+  limits and GeoIP routing are meaningless.
 
-برای Hysteria2 / TUIC از `proto: "udp"` یا `"tcp+udp"` استفاده کن.
+Use `proto: "udp"` or `"tcp+udp"` for Hysteria2 and TUIC.
 
 ---
 
-## کارایی
+## Performance
 
-### چرا چند کریر
+### Why several carriers
 
-| مشکل | با یک کانکشن | با N کریر |
+| Problem | One connection | N carriers |
 |---|---|---|
-| Head-of-line blocking | یک بسته‌ی گم‌شده همه‌ی فلوهای کاربران رو متوقف می‌کنه | فقط فلوهای همون کریر |
-| شیپینگ per-flow ISP | سقف می‌خوری | سقف×N |
-| از دست رفتن QUIC | کل تونل | فقط فلوهای روی QUIC |
+| Head-of-line blocking | one lost segment stalls every user flow | only the flows on that carrier |
+| Per-flow ISP shaping | you hit the ceiling | ceiling × N |
+| Losing QUIC to a UDP block | the whole tunnel | only the flows already on it |
 
-فلوهای جدید با **کوتاه‌ترین صف** توزیع می‌شن، وزن‌دار و مقیاس‌شده با EWMA تأخیر اوپن — مسیری که خراب می‌شه خودش خالی می‌شه، لازم نیست «مرده» اعلام بشه.
+New flows are assigned by shortest queue, weighted, and scaled by each
+carrier's EWMA open latency — so a degrading path drains itself instead of
+having to be declared dead.
 
-### تأخیر
+### Latency
 
-**Optimistic open**: درخواست اوپن و اولین بایت‌های کاربر با هم می‌رن و منتظر جواب نمی‌مونیم. یعنی تونل **صفر RTT** اضافه می‌کنه — یه TLS handshake کاربر در همون یک RTT تموم می‌شه، نه دو.
+**Optimistic open**: the open request and the user's first bytes go out
+together, and the reply is never waited for. The tunnel adds **zero round
+trips** — a user's TLS handshake completes in the one round trip it needs, not
+two.
 
-### حافظه — این رو بخون
+### Memory — read this
 
-`stream_window` هم یه دکمه‌ی سرعته هم سقف حافظه:
+`stream_window` is a memory ceiling as much as a speed knob:
 
 ```
-بدترین حالت بافر ≈ stream_window × max_streams × carriers
+worst-case buffered ≈ stream_window × max_streams × carriers
 ```
 
-با ۱۶MiB × ۲۵۶ × ۳ می‌شه ۱۲ گیگابایت. ترافیک VPN «کلی فلوی کوچک همزمان» است، که throughput کلش از همزمانی و تعداد کریر میاد، نه از پنجره‌ی بزرگ.
+16 MiB × 256 × 3 would be twelve gigabytes. VPN traffic is many concurrent
+small flows, where aggregate throughput comes from concurrency and from running
+several carriers, not from a large window.
 
-| پروفایل | پنجره | کریر | سقف حافظه | obfs |
+| Profile | Window | Carriers | Ceiling | obfs |
 |---|---|---|---|---|
-| `speed` | 4 MiB | 4 | ~3 GiB | خاموش |
-| `balanced` | 2 MiB | 3 | ~1.5 GiB | فقط کنترل |
-| `stealth` | 1 MiB | 2 | ~768 MiB | همه‌جا |
+| `speed` | 4 MiB | 4 | ~3 GiB | off |
+| `balanced` | 2 MiB | 3 | ~1.5 GiB | control only |
+| `stealth` | 1 MiB | 2 | ~768 MiB | everywhere |
 
-«سقف» بدترین حالت نظریه. در عمل چون رله می‌خونه و فوراً می‌نویسه، بافرها خالی می‌مونن و مصرف واقعی چند ده مگابایته. `serai check -c config.json` سقف رو برات حساب می‌کنه.
+The ceiling is theoretical worst case. In practice the relay reads and
+immediately writes, so buffers stay near empty and real usage is tens of
+megabytes. `serai check -c config.json` computes the ceiling for your settings.
 
-`GOMEMLIMIT` در یونیت systemd روی ۷۰٪ رم ست می‌شه — بدون این، یه اسپایک حافظه به‌جای یه GC می‌شه OOM kill.
+`GOMEMLIMIT` is set to 70% of RAM in the systemd unit — without it a memory
+spike is an OOM kill rather than a collection.
 
 ### CPU
 
-TLS غالب‌ترین هزینه‌ست. edge سایفرهای AES-GCM رو ترجیح می‌ده: روی CPU با AES-NI چند برابر ارزون‌تر از ChaCha20 به‌ازای هر گیگابایت. لایه obfs یه memcpy به‌ازای هر رکورد اضافه می‌کنه — در ۱Gbps با رکورد ۴KB حدود ۳۰ هزار رکورد در ثانیه، عملاً ناچیز.
+TLS dominates. The relay prefers AES-GCM suites: on a CPU with AES-NI that is
+several times cheaper per gigabyte than ChaCha20. The obfs layer adds one
+memcpy per record — at 1 Gbit/s with 4 KiB records that is about 30k records a
+second, which is noise.
 
 ---
 
-## مقایسه
+## Comparison
 
 | | frp / rathole | Backhaul | chisel | Serai |
 |---|---|---|---|---|
-| چند ترنسپورت همزمان | ✗ | ✗ | ✗ | ✓ QUIC + TLS + WSS |
-| Aggregation چند کریر | ✗ | استخر، تک‌ترنسپورت | ✗ | ✓ زمان‌بندی per-flow |
-| فینگرپرینت TLS مرورگر | ✗ | ✗ | ✗ | ✓ uTLS |
-| شکل‌دهی ترافیک | ✗ | ✗ | ✗ | ✓ |
-| تک‌پورت با روتینگ SNI | ✗ | ✗ | ✗ | ✓ |
-| decoy برای اکتیو-پروب | ✗ | ✗ | ✗ | ✓ ریورس‌پروکسی واقعی |
-| UDP | ضعیف | جزئی | ✗ | ✓ با جدول فلو و سقف |
-| PROXY protocol | جزئی | ✗ | ✗ | ✓ v1/v2 |
-| صفر RTT برای کانکشن جدید | ✗ | ✓ | ✗ | ✓ |
-| متریک Prometheus | ✗ | ✗ | ✗ | ✓ |
+| Several transports at once | ✗ | ✗ | ✗ | ✓ QUIC + TLS + WSS |
+| Multi-carrier aggregation | ✗ | pool, single transport | ✗ | ✓ scheduled per flow |
+| Browser TLS fingerprint | ✗ | ✗ | ✗ | ✓ uTLS |
+| Traffic shaping | ✗ | ✗ | ✗ | ✓ |
+| Single port with SNI routing | ✗ | ✗ | ✗ | ✓ |
+| Decoy for active probes | ✗ | ✗ | ✗ | ✓ real reverse proxy |
+| UDP | weak | partial | ✗ | ✓ flow table with a cap |
+| PROXY protocol | partial | ✗ | ✗ | ✓ v1/v2 |
+| Zero added RTT per connection | ✗ | ✓ | ✗ | ✓ |
+| Prometheus metrics | ✗ | ✗ | ✗ | ✓ |
 
-این جدول رو خودت تأیید کن، به حرف من اکتفا نکن. بنچمارک:
+Verify this table yourself rather than taking my word for it:
 
 ```bash
 # throughput
-iperf3 -s                                   # روی origin، به پورت فورواردشده
+iperf3 -s                                   # on the origin, behind a forward
 iperf3 -c <edge-ip> -p <port> -P 8 -t 60
 
-# تأخیر هر کانکشن جدید (مهم‌تر از throughput برای حس کاربر)
+# per-connection latency, which matters more than throughput for how it feels
 for i in $(seq 50); do
   curl -so /dev/null -w "%{time_connect}\n" https://<edge>:<port>/
 done | sort -n | awk '{a[NR]=$1} END {print "p50",a[int(NR*0.5)],"p95",a[int(NR*0.95)]}'
 
-# فینگرپرینت TLS خودت را ببین
-curl https://tls.peet.ws/api/clean     # از origin، با و بدون fingerprint
+# look at your own TLS fingerprint, with and without the mimicry
+curl https://tls.peet.ws/api/clean
 ```
+
+If JA3 does not change when you set `fingerprint`, uTLS is not engaged and you
+do not have the biggest advantage here.
 
 ---
 
-## مرجع کانفیگ
+## Configuration
 
-`//` به‌عنوان کامنت پذیرفته می‌شه.
+`//` line comments are accepted.
 
-### مشترک
+### Shared
 
-| کلید | توضیح |
+| Key | Meaning |
 |---|---|
-| `role` | `edge` یا `origin` |
-| `profile` | `speed` \| `balanced` \| `stealth` — نقطه‌ی شروع، هر فیلد صریح بر آن غالب است |
-| `psk_file` | مسیر فایل کلید (ترجیح بر `psk` درون‌خطی) |
+| `role` | `edge` or `origin` |
+| `profile` | `speed` \| `balanced` \| `stealth` — a starting point; explicit fields win |
+| `psk_file` | path to the key file, preferred over inline `psk` |
 | `obfs.scope` | `none` \| `control` \| `all` |
-| `tuning.*` | `carriers`، `stream_window`، `max_streams`، `copy_buffer`، `keepalive` |
-| `admin_addr` | پیش‌فرض `127.0.0.1:9900` — **هرگز عمومی bind نکن** |
+| `tuning.*` | `carriers`, `stream_window`, `max_streams`, `copy_buffer`, `keepalive` |
+| `admin_addr` | defaults to `127.0.0.1:9900` — **never bind this publicly** |
 
 ### edge
 
-| کلید | توضیح |
+| Key | Meaning |
 |---|---|
-| `server.control_addr` | تنها پورت TCP، معمولاً `:443` |
-| `server.quic_addr` | پورت UDP؛ خالی = QUIC خاموش |
-| `server.tunnel_sni` | نامی که به خود Serai می‌رسد؛ هر SNI دیگر یا فوروارد می‌شود یا به decoy |
-| `server.ws_path` | مسیر WebSocket — یه چیز بی‌نشان انتخاب کن |
-| `server.decoy_upstream` | سایتی که برای پروب‌ها آینه می‌شود |
-| `server.allow_ports` | محدوده‌ی پورتی که یک origin می‌تواند بگیرد |
+| `server.control_addr` | the single TCP port, normally `:443` |
+| `server.quic_addr` | the UDP port; empty disables QUIC |
+| `server.tunnel_sni` | the name that reaches Serai itself; any other SNI is forwarded or sent to the decoy |
+| `server.ws_path` | the WebSocket endpoint — pick something unremarkable |
+| `server.cert_file`, `server.key_file` | certificate for `tunnel_sni` |
+| `server.decoy_upstream` | site mirrored for probers |
+| `server.allow_ports` | which ports an origin may open; 443 is served by SNI and needs no entry |
 
 ### origin
 
-| کلید | توضیح |
+| Key | Meaning |
 |---|---|
-| `edge.paths[]` | `transport` (`quic`/`tls`/`websocket`)، `addr`/`url`، `fingerprint`، `role`، `weight`، `edge_addr`، `headers` |
-| `edge.pinned_spki` | pin کلید عمومی؛ لازم اگر `insecure` بدهی |
-| `edge.reconnect` | `min`، `max`، `factor`، `jitter` |
-| `forwards[]` | بالا توضیح داده شد |
+| `edge.paths[]` | `transport` (`quic`/`tls`/`websocket`), `addr`/`url`, `fingerprint`, `role`, `weight`, `edge_addr`, `headers` |
+| `edge.pinned_spki` | public-key pin; required if `insecure` is set |
+| `edge.reconnect` | `min`, `max`, `factor`, `jitter` |
+| `forwards[]` | as above |
 
-`role` روی مسیر: `both` (پیش‌فرض) · `data` (فقط ترافیک انبوه) · `bootstrap` (فقط کنترل — مسیر گران/کند مثل CDN).
-
----
-
-## مدل تهدید و محدودیت‌های واقعی
-
-چیزهایی که این ابزار **نمی‌کنه** — مهم‌تر از چیزهایی که می‌کنه:
-
-- **مقابله با بلاک کل IP بر اساس حجم.** اگر یک IP خانگی/VPS روزانه ترابایت جابه‌جا کنه، هیچ لایه‌ای نجاتش نمی‌ده. این یه مسئله‌ی عملیاتیه، نه پروتکلی.
-- **مخفی کردن اینکه کاربران به این IP وصل می‌شن.** رله در معرض دیده؛ کاری که می‌کنیم اینه که شبیه وب‌سرور باشه.
-- **QUIC و uTLS با هم.** QUIC پشته‌ی TLS خودش رو داره؛ شکل‌دهی ClientHello اونجا اعمال نمی‌شه. قابل قبوله چون HTTP/3 فراگیره، و جایی که UDP بسته باشه racer به WebSocket می‌افته.
-- **obfs رمزنگاری نیست.** یه لایه‌ی شکل‌دهیه؛ محرمانگی از TLS زیرش میاد.
-- **رله‌ی تسخیرشده.** اگر رله به دست کسی بیفته، کلید رو داره و می‌تونه ترافیک فورواردشده رو ببینه — ولی TLS کاربر تا Xray سرتاسریه، پس محتوا رو نمی‌بینه، و نمی‌تونه origin رو مجبور کنه به هاست دلخواه وصل شه (مقصدها فقط در کانفیگ origin هستن).
-- **اثر انگشت زمانی.** ترافیک پوششی الگوهای ساده رو می‌شکنه، نه یه طبقه‌بند آموزش‌دیده روی حجم طولانی‌مدت.
+Path `role`: `both` (default) · `data` (bulk only) · `bootstrap` (control only —
+for an expensive or slow path such as a CDN).
 
 ---
 
-## عملیات
+## Threat model and real limits
+
+What this does **not** do matters more than what it does:
+
+- **Volume-based blocking.** If one address moves terabytes a day, no layer
+  here saves it. That is an operational problem, not a protocol one.
+- **Hiding that users connect to the relay.** The relay is exposed by design;
+  the goal is that it looks like a web server.
+- **QUIC plus uTLS.** QUIC carries its own TLS stack, so ClientHello shaping
+  does not apply there. Acceptable, because HTTP/3 is ubiquitous — and where
+  UDP is blocked the racer falls back to the WebSocket path.
+- **obfs is not encryption.** It is a shaping layer; confidentiality comes from
+  the TLS beneath it.
+- **A seized relay.** It holds the key and sees forwarded traffic, but user TLS
+  is end-to-end to Xray so it cannot read content, and it cannot make the
+  origin connect to a host the origin did not already configure.
+- **Timing analysis.** Cover traffic breaks simple patterns, not a classifier
+  trained on long-run volume.
+
+---
+
+## Operating it
 
 ```bash
-serai check -c /etc/serai/origin.json     # اعتبارسنجی + نمایش کاری که می‌کند
-serai keygen                              # کلید تازه
-serai pin -cert fullchain.pem              # pin برای CA خصوصی
-curl -s localhost:9900/status | jq         # وضعیت زنده
+serai check -c /etc/serai/origin.json     # validate and print what it will do
+serai keygen                              # a fresh key
+serai pin -cert fullchain.pem              # pin for a private CA
+curl -s localhost:9900/status | jq         # live state
 curl -s localhost:9900/metrics             # Prometheus
 journalctl -u serai-origin -f
+
+sudo bash install.sh diagnose              # dns, ports, certificate, carriers
+sudo bash install.sh pairing               # what the other server needs
 ```
-
----
-
