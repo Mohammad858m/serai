@@ -408,6 +408,51 @@ probe_webroot() {
   [[ "$body" == "$token" ]]
 }
 
+# make_self_signed issues a long-lived self-signed certificate for a name that
+# need not exist in DNS at all.
+#
+# This exists because a relay is often brought up before a domain is pointed at
+# it, or on a network where inbound port 80 is intercepted and the ACME HTTP
+# challenge can never succeed. The SNI is only a label the two halves agree on:
+# the origin dials the relay by IP and claims this name, and pins the public
+# key, so there is no certificate authority in the path and nothing to verify
+# by DNS.
+#
+# It is strictly weaker camouflage. Scanning 443 for self-signed certificates
+# is the cheapest way there is to find a relay, and a prober that finds one
+# learns immediately that no real website lives here, which makes the decoy
+# pointless. Use it to get a tunnel working, then move to a real certificate.
+make_self_signed() {
+  local name="$1"
+  CERT_FILE="$CONF_DIR/self.crt"
+  KEY_FILE="$CONF_DIR/self.key"
+
+  mkdir -p "$CONF_DIR"
+  chmod 0700 "$CONF_DIR"
+
+  if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+    ok "reusing the existing self-signed certificate"
+    return
+  fi
+
+  title "Self-signed certificate for $name"
+  command -v openssl >/dev/null || spin "installing openssl" pkg_install openssl
+
+  # P-256 rather than RSA: smaller handshake, and ECDSA is what current
+  # browsers negotiate, so the handshake looks less unusual.
+  spin "generating key and certificate" \
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -keyout "$KEY_FILE" -out "$CERT_FILE" -days 3650 \
+      -subj "/CN=$name" -addext "subjectAltName=DNS:$name"
+
+  chmod 0600 "$KEY_FILE"
+  chmod 0644 "$CERT_FILE"
+  ok "self-signed certificate written to $CERT_FILE"
+
+  warn "the origin must pin this key, because there is no CA to verify it."
+  warn "The pin is printed at the end of this run."
+}
+
 obtain_cert() {
   local domain="$1"
   CERT_FILE="/etc/letsencrypt/live/$domain/fullchain.pem"
@@ -571,8 +616,16 @@ install_edge() {
     fi
   fi
 
+  local SELF_SIGNED=""
+  info "leave the next answer blank to self-sign for testing, with no domain"
+  info "and no certificate authority."
   ask DOMAIN   "tunnel domain (points at this server)"
-  [[ -n "$DOMAIN" ]] || die "a domain is required"
+  if [[ -z "$DOMAIN" ]]; then
+    SELF_SIGNED=1
+    info "testing mode: the name below only has to match on both halves,"
+    info "it is never looked up in DNS"
+    ask DOMAIN "name for the self-signed certificate" "tun.internal"
+  fi
   ask DECOY    "decoy site to mirror for probers" "https://www.lipsum.com"
   ask WSPATH   "websocket path" "/$(head -c 8 /dev/urandom | base64 | tr -dc 'a-z0-9' | head -c 8)"
   ask PROFILE  "profile (speed / balanced / stealth)" "balanced"
@@ -598,7 +651,11 @@ install_edge() {
   done
 
   ensure_go; build_binary
-  obtain_cert "$DOMAIN"
+  if [[ -n "$SELF_SIGNED" ]]; then
+    make_self_signed "$DOMAIN"
+  else
+    obtain_cert "$DOMAIN"
+  fi
 
   mkdir -p "$CONF_DIR" "$STATE_DIR"
   chmod 0700 "$CONF_DIR"
@@ -658,14 +715,24 @@ CONF
   printf '\n'; rule
   printf '%s  Edge is live. Paste this into the origin installer.%s\n' "$C_BOLD$C_MINT" "$C_RESET"
   rule
-  kv "domain"        "$DOMAIN"
+  kv "tunnel name"    "$DOMAIN"
+  kv "relay address"  "$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || echo '<this host IP>')"
   kv "websocket path" "$WSPATH"
   kv "allowed ports"  "$ALLOW  (plus 443 via SNI)"
   kv "pre-shared key" "$psk"
   kv "certificate pin" "$pin"
   rule
   printf '  %sThe key is the only secret. Move it over an existing secure%s\n' "$C_DIM" "$C_RESET"
-  printf '  %schannel, not over the link you are about to build.%s\n\n' "$C_DIM" "$C_RESET"
+  printf '  %schannel, not over the link you are about to build.%s\n' "$C_DIM" "$C_RESET"
+
+  if [[ -n "$SELF_SIGNED" ]]; then
+    printf '\n'
+    warn "this relay is self-signed, so the origin needs the pin above and"
+    warn "will connect by address rather than by name."
+    warn "Anyone scanning 443 can tell there is no real site here. Move to a"
+    warn "real certificate before this carries traffic you care about."
+  fi
+  printf '\n'
 }
 
 # ────────────────────────────────────────────────────────── install origin ────
@@ -678,21 +745,45 @@ install_origin() {
   info "nothing here needs an open port: this host dials the relay."
   printf '\n'
 
-  ask DOMAIN  "the edge's domain"
-  [[ -n "$DOMAIN" ]] || die "the edge domain is required"
+  ask DOMAIN  "the relay's tunnel name (as the edge installer printed it)"
+  [[ -n "$DOMAIN" ]] || die "the relay's tunnel name is required"
+  ask EDGEADDR "the relay's address, host:port (blank to resolve $DOMAIN)" ""
   ask PSK     "pre-shared key from the edge installer"
   [[ -n "$PSK" ]] || die "the pre-shared key is required"
   ask WSPATH  "websocket path from the edge installer" "/ws"
+  printf '\n'
+  info "if the relay uses a self-signed certificate, paste the pin the edge"
+  info "installer printed. Leave blank when the relay has a real certificate."
+  ask PIN     "certificate pin (sha256/...)" ""
   ask PROFILE "profile (speed / balanced / stealth)" "balanced"
   printf '\n'
   info "now the forwarding rules. The relay opens these ports; a user who"
   info "connects to them reaches the matching local port on this host."
   printf '\n'
   ask MAINPORT "main inbound port (same on both sides)" "443"
-  ask SNILIST  "SNI that routes to it on the relay's 443" "vpn.$DOMAIN"
+  if [[ -n "$PIN" ]]; then
+    # With a self-signed relay there is normally no DNS for the tunnel name,
+    # so routing user traffic by SNI would mean inventing a second name that
+    # also resolves nowhere. A plain port is the honest default for a test.
+    info "self-signed relay: forwarding by port rather than by SNI, since the"
+    info "tunnel name does not resolve"
+    SNILIST=""
+  else
+    ask SNILIST "SNI that routes to it on the relay's 443" "vpn.$DOMAIN"
+  fi
   ask EXTRA    "extra ports to forward (ranges allowed, blank for none)" "8000-9000"
   ask PANEL    "forward the panel's web port too? (port, or blank)" ""
   ask CARRIERS "parallel carriers" "3"
+
+  # A self-signed relay cannot be verified by a CA, so the pin is the only
+  # thing standing between this tunnel and anyone who can answer on that
+  # address. Refuse to disable verification without one.
+  local VERIFY_BLOCK=""
+  if [[ -n "$PIN" ]]; then
+    VERIFY_BLOCK="
+    \"pinned_spki\": [\"${PIN#sha256/}\"],
+    \"insecure\": true,"
+  fi
 
   ensure_go; build_binary
 
@@ -706,8 +797,8 @@ install_origin() {
     {
       "name": "main",
       "proto": "tcp",
-      "edge_ports": "$MAINPORT",
-      "sni": ["$SNILIST"],
+      "edge_ports": "$MAINPORT",${SNILIST:+
+      \"sni\": [\"$SNILIST\"],}
       "target": "127.0.0.1:$MAINPORT",
       "proxy_protocol": 2
     }
@@ -752,13 +843,16 @@ FWD
     "paths": [
       {
         "transport": "quic",
-        "addr": "$DOMAIN:443",
+        "addr": "${EDGEADDR:-$DOMAIN:443}",
+        "host": "$DOMAIN",
         "role": "data",
         "weight": 3
       },
       {
         "transport": "websocket",
-        "url": "wss://$DOMAIN$WSPATH",
+        "url": "wss://$DOMAIN$WSPATH",${EDGEADDR:+
+        \"edge_addr\": \"$EDGEADDR\",}
+        "host": "$DOMAIN",
         "fingerprint": "chrome",
         "role": "both",
         "weight": 2,
@@ -767,7 +861,7 @@ FWD
           "Accept-Language": "en-US,en;q=0.9"
         }
       }
-    ],
+    ],$VERIFY_BLOCK
     "reconnect": { "min": "1s", "max": "120s", "factor": 1.8, "jitter": 0.3 }
   },
 
