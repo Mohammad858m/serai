@@ -143,8 +143,25 @@ ensure_go() {
   export PATH="/usr/local/go/bin:$PATH"
 }
 
+# go_tidy and go_build run as functions rather than nested "bash -c" strings.
+# An earlier version built the -ldflags argument inside a quoted shell string;
+# the command substitution for the version never ran and the whole thing was
+# handed to the linker as flags, which answered with its usage text.
+go_tidy() {
+  cd "$1" || return 1
+  GOFLAGS=-mod=mod go mod tidy
+}
+
+go_build() {
+  local src="$1" ver="$2"
+  cd "$src" || return 1
+  CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X main.version=$ver" \
+    -o "$BIN" ./cmd/serai
+}
+
 build_binary() {
-  local src
+  local src ver
   if [[ -f "$(dirname "$0")/../go.mod" ]]; then
     src="$(cd "$(dirname "$0")/.." && pwd)"
     info "building from local checkout at $src"
@@ -161,21 +178,21 @@ build_binary() {
   export GOTOOLCHAIN=local
   export GOPROXY="${SERAI_GOPROXY:-https://proxy.golang.org,https://goproxy.io,https://goproxy.cn,direct}"
 
-  if ! spin "resolving dependencies" bash -c "cd '$src' && GOFLAGS=-mod=mod go mod tidy"; then
+  if ! spin "resolving dependencies" go_tidy "$src"; then
     warn "could not fetch modules from any proxy"
     warn "if this network blocks them, either set a reachable mirror:"
-    warn "    SERAI_GOPROXY=https://your-mirror,direct bash $0 ${1:-}"
+    warn "    SERAI_GOPROXY=https://your-mirror,direct bash $0 edge"
     warn "or build on the other server and copy the binary to $BIN"
     return 1
   fi
 
-  spin "building serai (static, stripped)" bash -c "
-    cd '$src' &&
-    GOFLAGS=-trimpath CGO_ENABLED=0 go build \
-      -ldflags '-s -w -X main.version=\$(git -C \"$src\" describe --tags --always 2>/dev/null || echo dev)' \
-      -o '$BIN' ./cmd/serai"
+  ver="$(git -C "$src" describe --tags --always 2>/dev/null || echo dev)"
+  if ! spin "building serai (static, stripped)" go_build "$src" "$ver"; then
+    return 1
+  fi
+
   chmod 0755 "$BIN"
-  ok "installed $($BIN version)"
+  ok "installed $("$BIN" version)"
 }
 
 # ─────────────────────────────────────────────────────────── kernel tuning ────
@@ -390,12 +407,21 @@ install_edge() {
   info "open. Every inbound port you forward has to fall inside it, so keep"
   info "it a range, not a single port. 443 is served by SNI and needs no"
   info "entry. You can widen it later in $CONF_DIR/edge.json."
-  ask ALLOW    "port range an origin may open (ranges ok)" "8000-9000,10000-20000"
-  if [[ "$ALLOW" != *-* && "$ALLOW" != *,* ]]; then
+  # Keep asking until the answer is a range or the operator insists. A single
+  # port here silently refuses every forward the origin asks for, which is a
+  # confusing failure to debug from the other end.
+  while true; do
+    ask ALLOW "port range an origin may open (ranges ok)" "8000-9000,10000-20000"
+    [[ -n "$ALLOW" ]] || continue
+    if [[ "$ALLOW" == *-* || "$ALLOW" == *,* ]]; then
+      break
+    fi
     warn "'$ALLOW' is a single port — the origin will only be able to forward"
     warn "that one port, and anything else it asks for will be refused"
-    confirm "keep it anyway?" || ask ALLOW "port range an origin may open" "8000-9000,10000-20000"
-  fi
+    if confirm "keep '$ALLOW' anyway?"; then
+      break
+    fi
+  done
 
   ensure_go; build_binary
   obtain_cert "$DOMAIN"
