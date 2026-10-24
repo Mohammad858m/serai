@@ -1,0 +1,24 @@
+# build output
+/serai
+/serai.exe
+/dist/
+/build/
+
+# go
+*.test
+*.out
+vendor/
+
+# secrets and local state — never commit these
+*.pem
+*.key
+psk
+psk.txt
+*.local.json
+/etc/
+
+# editors and os
+.vscode/
+.idea/
+*.swp
+.DS_Store
