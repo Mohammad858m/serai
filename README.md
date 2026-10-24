@@ -247,14 +247,3 @@ journalctl -u serai-origin -f
 
 ---
 
-## وضعیت
-
-**این کد در محیطی نوشته شده که Go نصب نبوده، پس کامپایل و تست نشده.** اولین کاری که باید بکنی:
-
-```bash
-go mod tidy && go vet ./... && go build ./...
-```
-
-انتظار چند خطای جزئی import/API داشته باش — مخصوصاً در `internal/transport/quic.go`، چون API عمومی quic-go بین نسخه‌ها جابه‌جا می‌شه (`quic.Connection` در ≥0.50 به `*quic.Conn` تغییر کرده). همه‌ی تماس‌های QUIC عمداً در همون یک فایل محدود شدن.
-
-تست‌های واحد نوشته نشده. اولویت‌ها اگر خواستی ادامه بدی: کدک `wire`، `config.ParsePorts`، پارسر `sniff`، و یه تست end-to-end روی loopback.
