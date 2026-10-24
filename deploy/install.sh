@@ -357,6 +357,57 @@ configure_firewall() {
 }
 
 # ───────────────────────────────────────────────────────────── certificate ────
+# port80_process names whatever is listening on 80, for a useful message
+# instead of "port 80 is in use".
+port80_process() {
+  ss -ltnp 2>/dev/null |
+    awk '$4 ~ /:80$/ {print; exit}' |
+    sed -n 's/.*(("\([^"]*\)".*/\1/p'
+}
+
+# port80_unit maps that listener back to its systemd unit via the cgroup, so
+# the installer can offer to stop the right thing rather than guessing nginx.
+port80_unit() {
+  local pid
+  pid="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:80$/ {print; exit}' |
+         sed -n 's/.*pid=\([0-9]*\).*/\1/p')"
+  [[ -n "$pid" && -r "/proc/$pid/cgroup" ]] || return 0
+  grep -o '[^/]*\.service' "/proc/$pid/cgroup" 2>/dev/null | head -1
+}
+
+# certbot_standalone issues the certificate on a free port 80, recording hooks
+# so unattended renewal works the same way three months from now. Without the
+# hooks, renewal silently fails on a host where something else owns port 80 --
+# and the failure surfaces as an expired certificate, not as an error anyone
+# was watching for.
+certbot_standalone() {
+  local domain="$1" unit="${2:-}"
+  local -a hooks=()
+  if [[ -n "$unit" ]]; then
+    hooks=(--pre-hook "systemctl stop $unit" --post-hook "systemctl start $unit")
+  fi
+  spin "requesting certificate (standalone, port 80)" \
+    certbot certonly --standalone --non-interactive --agree-tos \
+      --register-unsafely-without-email "${hooks[@]}" -d "$domain"
+}
+
+# probe_webroot verifies that the challenge directory is actually served over
+# HTTP before a certbot attempt is spent on it. Let's Encrypt rate-limits
+# failures, and a wrong webroot is the most common way this step fails.
+probe_webroot() {
+  local domain="$1" root="$2"
+  local dir="$root/.well-known/acme-challenge"
+  local token body
+  token="serai-probe-$$-$RANDOM"
+
+  mkdir -p "$dir" 2>/dev/null || return 1
+  printf '%s' "$token" >"$dir/$token" 2>/dev/null || return 1
+  body="$(curl -fsS --max-time 10 "http://$domain/.well-known/acme-challenge/$token" 2>/dev/null || true)"
+  rm -f "$dir/$token"
+
+  [[ "$body" == "$token" ]]
+}
+
 obtain_cert() {
   local domain="$1"
   CERT_FILE="/etc/letsencrypt/live/$domain/fullchain.pem"
@@ -374,16 +425,45 @@ obtain_cert() {
 
   command -v certbot >/dev/null || spin "installing certbot" pkg_install certbot
 
+  # Let's Encrypt has to fetch a file over plain HTTP on port 80. Three ways to
+  # arrange that, tried in order of reliability rather than convenience.
   if ! ss -ltn 2>/dev/null | grep -q ':80 '; then
-    spin "requesting certificate (standalone, port 80)" \
-      certbot certonly --standalone --non-interactive --agree-tos \
-        --register-unsafely-without-email -d "$domain"
+    certbot_standalone "$domain"
   else
-    warn "port 80 is in use; using webroot mode"
-    ask WEBROOT "webroot path" "/var/www/html"
-    spin "requesting certificate (webroot)" \
-      certbot certonly --webroot -w "$WEBROOT" --non-interactive --agree-tos \
-        --register-unsafely-without-email -d "$domain"
+    local holder unit
+    holder="$(port80_process)"
+    unit="$(port80_unit)"
+    warn "port 80 is held by ${holder:-an unknown process}${unit:+ ($unit)}"
+
+    if [[ -n "$unit" ]] && confirm "stop $unit for a few seconds and use standalone mode?"; then
+      # The stop and start are handed to certbot as hooks rather than done
+      # here, so that unattended renewal repeats them. certbot runs the post
+      # hook even when the attempt fails; the explicit start below covers the
+      # case where certbot is killed outright, because leaving someone's web
+      # server down is worse than not getting a certificate.
+      certbot_standalone "$domain" "$unit" || true
+      systemctl start "$unit" >/dev/null 2>&1 || true
+    else
+      info "webroot mode: certbot writes the challenge into a directory that"
+      info "the server on port 80 must already serve"
+      ask WEBROOT "webroot path" "/var/www/html"
+
+      # Prove the path is actually reachable before spending a certbot attempt.
+      # Let's Encrypt rate-limits failures, and a 404 from the wrong webroot is
+      # the single most common way this step fails.
+      if probe_webroot "$domain" "$WEBROOT"; then
+        ok "challenge directory is reachable over http"
+        spin "requesting certificate (webroot)" \
+          certbot certonly --webroot -w "$WEBROOT" --non-interactive --agree-tos \
+            --register-unsafely-without-email -d "$domain"
+      else
+        err "http://$domain/.well-known/acme-challenge/ does not serve files"
+        err "from $WEBROOT — certbot would fail with a 404"
+        warn "either point this at the document root of whatever holds port 80,"
+        warn "or stop that service and re-run so standalone mode can be used"
+        return 1
+      fi
+    fi
   fi
 
   [[ -f "$CERT_FILE" ]] || die "certbot did not produce $CERT_FILE"
@@ -468,6 +548,29 @@ install_edge() {
   info "bandwidth, because traffic goes straight here."
   printf '\n'
 
+  # Check 443 before asking anything else. The relay routes by SNI on raw TCP,
+  # so it cannot sit behind another web server on that port -- and finding that
+  # out after building, certificating and configuring wastes the whole run.
+  local p443 u443
+  p443="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit}' | sed -n 's/.*(("\([^"]*\)".*/\1/p')"
+  if [[ -n "$p443" && "$p443" != serai ]]; then
+    u443="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit}' | sed -n 's/.*pid=\([0-9]*\).*/\1/p')"
+    [[ -n "$u443" && -r "/proc/$u443/cgroup" ]] &&
+      u443="$(grep -o '[^/]*\.service' "/proc/$u443/cgroup" 2>/dev/null | head -1)" || u443=""
+    err "tcp/443 is held by $p443${u443:+ ($u443)}"
+    warn "the relay needs 443 to itself: it reads the SNI off raw TCP and"
+    warn "forwards the bytes untouched, so it cannot run behind a web server."
+    warn "Port 80 can stay where it is."
+    if [[ -n "$u443" ]]; then
+      confirm "stop and disable $u443 on 443?" || die "free tcp/443 and run this again"
+      systemctl stop "$u443" && ok "stopped $u443"
+      warn "$u443 is stopped but still enabled; it will fight for 443 on reboot"
+      confirm "disable $u443 at boot too?" && systemctl disable "$u443" >/dev/null 2>&1 && ok "disabled $u443"
+    else
+      die "free tcp/443 and run this again"
+    fi
+  fi
+
   ask DOMAIN   "tunnel domain (points at this server)"
   [[ -n "$DOMAIN" ]] || die "a domain is required"
   ask DECOY    "decoy site to mirror for probers" "https://www.lipsum.com"
@@ -497,11 +600,21 @@ install_edge() {
   ensure_go; build_binary
   obtain_cert "$DOMAIN"
 
-  local psk
-  psk="$("$BIN" keygen)"
   mkdir -p "$CONF_DIR" "$STATE_DIR"
   chmod 0700 "$CONF_DIR"
-  printf '%s\n' "$psk" >"$CONF_DIR/psk"
+
+  # Keep an existing key across re-runs. Re-running the installer is the normal
+  # way to recover from a failed certificate step, and silently minting a new
+  # key there would break an origin that is already paired -- with no error on
+  # this side to explain why.
+  local psk
+  if [[ -s "$CONF_DIR/psk" ]]; then
+    psk="$(cat "$CONF_DIR/psk")"
+    ok "reusing the existing pre-shared key"
+  else
+    psk="$("$BIN" keygen)"
+    printf '%s\n' "$psk" >"$CONF_DIR/psk"
+  fi
   chmod 0600 "$CONF_DIR/psk"
 
   cat >"$CONF_DIR/edge.json" <<CONF
