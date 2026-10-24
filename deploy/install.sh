@@ -37,15 +37,86 @@ err()   { printf '  %s✘%s %s\n' "$C_ROSE" "$C_RESET" "$*" >&2; }
 die()   { err "$*"; exit 1; }
 kv()    { printf '  %s%-22s%s %s\n' "$C_SLATE" "$1" "$C_RESET" "$2"; }
 
+# Six rows of the logo, each printed in its own shade so the wordmark reads as
+# a gradient rather than a flat block.
 banner() {
+  local g=(
+    $'\e[38;5;80m' $'\e[38;5;79m' $'\e[38;5;78m'
+    $'\e[38;5;114m' $'\e[38;5;146m' $'\e[38;5;183m'
+  )
+  [[ -z "$C_TEAL" ]] && g=("" "" "" "" "" "")
+
+  local rows=(
+'  ███████╗ ███████╗ ██████╗   █████╗  ██╗'
+'  ██╔════╝ ██╔════╝ ██╔══██╗ ██╔══██╗ ██║'
+'  ███████╗ █████╗   ██████╔╝ ███████║ ██║'
+'  ╚════██║ ██╔══╝   ██╔══██╗ ██╔══██║ ██║'
+'  ███████║ ███████╗ ██║  ██║ ██║  ██║ ██║'
+'  ╚══════╝ ╚══════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝'
+  )
+
   printf '\n'
-  printf '%s   ███████ ███████ ██████   █████  ██%s\n'  "$C_TEAL"  "$C_RESET"
-  printf '%s   ██      ██      ██   ██ ██   ██ ██%s\n'  "$C_TEAL"  "$C_RESET"
-  printf '%s   ███████ █████   ██████  ███████ ██%s\n'  "$C_MINT"  "$C_RESET"
-  printf '%s        ██ ██      ██   ██ ██   ██ ██%s\n'  "$C_MINT"  "$C_RESET"
-  printf '%s   ███████ ███████ ██   ██ ██   ██ ██%s\n'  "$C_PLUM"  "$C_RESET"
-  printf '\n   %sa caravanserai for your traffic%s\n' "$C_DIM" "$C_RESET"
-  printf '   %sreverse tunnel · multipath · browser-shaped TLS%s\n\n' "$C_SLATE" "$C_RESET"
+  local i
+  for i in "${!rows[@]}"; do
+    printf '%s%s%s\n' "${g[i]}" "${rows[i]}" "$C_RESET"
+  done
+  printf '\n  %sa caravanserai for your traffic%s\n' "$C_DIM" "$C_RESET"
+  printf '  %sreverse tunnel · multipath · browser-shaped TLS%s\n' "$C_SLATE" "$C_RESET"
+  printf '\n'
+  status_strip
+}
+
+# status_strip summarises what is installed and running, so the menu does not
+# have to be read blind.
+status_strip() {
+  local hostline="unknown" ver="not installed"
+  if [[ -r /etc/os-release ]]; then
+    hostline="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-$ID}") · $(uname -m)"
+  fi
+  [[ -x "$BIN" ]] && ver="$("$BIN" version 2>/dev/null | awk '{print $2}')"
+
+  rule
+  printf '  %s%-8s%s ' "$C_SLATE" "host" "$C_RESET"
+  pad_visible "$hostline" 38
+  printf '%s%-8s%s %s\n' "$C_SLATE" "serai" "$C_RESET" "$ver"
+
+  printf '  %s%-8s%s ' "$C_SLATE" "edge" "$C_RESET"
+  pad_visible "$(role_state edge)" 38
+  printf '%s%-8s%s %s\n' "$C_SLATE" "origin" "$C_RESET" "$(role_state origin)"
+  rule
+}
+
+# pad_visible writes a string padded to a column width, ignoring ANSI escapes
+# when measuring. printf's own %-Ns counts the escape bytes, which pushes every
+# coloured cell out of alignment.
+pad_visible() {
+  local s="$1" want="$2" plain pad
+  plain="$(printf '%s' "$s" | sed 's/\x1b\[[0-9;]*m//g')"
+  printf '%s' "$s"
+  pad=$(( want - ${#plain} ))
+  (( pad > 0 )) && printf '%*s' "$pad" ''
+}
+
+# role_state renders one role's unit state plus a live carrier count.
+role_state() {
+  local role="$1" unit="serai-$1"
+  [[ -f "/etc/systemd/system/$unit.service" ]] || { printf '%s—  not installed%s' "$C_DIM" "$C_RESET"; return; }
+
+  if ! systemctl is-active --quiet "$unit"; then
+    printf '%s● inactive%s' "$C_ROSE" "$C_RESET"
+    return
+  fi
+
+  local n=""
+  if command -v curl >/dev/null; then
+    n="$(curl -fsS --max-time 2 localhost:9900/status 2>/dev/null \
+         | grep -o '"transport"' | wc -l | tr -d ' ')"
+  fi
+  if [[ -n "$n" && "$n" != 0 ]]; then
+    printf '%s● active%s · %s carrier(s)' "$C_MINT" "$C_RESET" "$n"
+  else
+    printf '%s● active%s' "$C_MINT" "$C_RESET"
+  fi
 }
 
 spin() {
@@ -670,44 +741,294 @@ do_uninstall() {
   ok "serai removed"
 }
 
-menu() {
-  banner
-  rule
-  printf '    %s1%s  Install edge      %s— the relay, in-country, users dial it%s\n' "$C_BOLD$C_TEAL" "$C_RESET" "$C_DIM" "$C_RESET"
-  printf '    %s2%s  Install origin    %s— the host with 3x-ui, dials out%s\n'       "$C_BOLD$C_TEAL" "$C_RESET" "$C_DIM" "$C_RESET"
-  printf '    %s3%s  Status\n'                                                       "$C_BOLD$C_TEAL" "$C_RESET"
-  printf '    %s4%s  Follow logs\n'                                                  "$C_BOLD$C_TEAL" "$C_RESET"
-  printf '    %s5%s  Restart\n'                                                      "$C_BOLD$C_TEAL" "$C_RESET"
-  printf '    %s6%s  Re-apply kernel tuning\n'                                       "$C_BOLD$C_TEAL" "$C_RESET"
-  printf '    %s7%s  Uninstall\n'                                                    "$C_BOLD$C_ROSE" "$C_RESET"
-  printf '    %s0%s  Quit\n'                                                         "$C_BOLD$C_SLATE" "$C_RESET"
-  rule
-  ask CHOICE "choose" "3"
-  case "$CHOICE" in
-    1) install_edge ;;
-    2) install_origin ;;
-    3) show_status ;;
-    4) local u; u=$(installed_unit); journalctl -u "$u" -f ;;
-    5) local u; u=$(installed_unit); systemctl restart "$u" && ok "restarted $u" ;;
-    6) need_root; tune_kernel ;;
-    7) do_uninstall ;;
-    0) exit 0 ;;
-    *) err "unknown choice"; exit 2 ;;
-  esac
-}
-
+# ─────────────────────────────────────────────────────── extra operations ────
 installed_unit() {
   if [[ -f /etc/systemd/system/serai-edge.service ]]; then echo serai-edge
   elif [[ -f /etc/systemd/system/serai-origin.service ]]; then echo serai-origin
-  else die "serai is not installed here"; fi
+  else return 1; fi
+}
+
+installed_conf() {
+  case "$(installed_unit 2>/dev/null)" in
+    serai-edge)   echo "$CONF_DIR/edge.json" ;;
+    serai-origin) echo "$CONF_DIR/origin.json" ;;
+    *) return 1 ;;
+  esac
+}
+
+require_install() {
+  installed_unit >/dev/null 2>&1 || { err "serai is not installed on this host"; return 1; }
+}
+
+# json_field pulls one string value out of the config without needing jq,
+# which is not installed on a fresh VPS.
+json_field() {
+  grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" 2>/dev/null |
+    head -1 | sed 's/.*:[[:space:]]*"\(.*\)"/\1/'
+}
+
+show_pairing() {
+  local conf; conf="$(installed_conf)" || { err "nothing installed here"; return 1; }
+  title "Pairing details"
+
+  if [[ -r "$CONF_DIR/psk" ]]; then
+    kv "pre-shared key" "$(cat "$CONF_DIR/psk")"
+  else
+    warn "no key file at $CONF_DIR/psk"
+  fi
+
+  local sni ws cert
+  sni="$(json_field "$conf" tunnel_sni)"
+  ws="$(json_field "$conf" ws_path)"
+  cert="$(json_field "$conf" cert_file)"
+  [[ -n "$sni" ]] && kv "tunnel domain" "$sni"
+  [[ -n "$ws" ]]  && kv "websocket path" "$ws"
+  if [[ -n "$cert" && -r "$cert" && -x "$BIN" ]]; then
+    kv "certificate pin" "$("$BIN" pin -cert "$cert" 2>/dev/null || echo '(unreadable)')"
+  fi
+
+  printf '\n  %sMove the key over a channel you already trust, never over the%s\n' "$C_DIM" "$C_RESET"
+  printf '  %slink you are about to build with it.%s\n' "$C_DIM" "$C_RESET"
+}
+
+edit_config() {
+  local conf unit
+  conf="$(installed_conf)" || { err "nothing installed here"; return 1; }
+  unit="$(installed_unit)"
+
+  "${EDITOR:-nano}" "$conf"
+
+  if [[ -x "$BIN" ]] && "$BIN" check -c "$conf" >/dev/null 2>&1; then
+    ok "config is valid"
+    confirm "restart $unit now?" && systemctl restart "$unit" && ok "restarted"
+  else
+    err "config is NOT valid - the service will refuse to start"
+    [[ -x "$BIN" ]] && "$BIN" check -c "$conf" 2>&1 | sed 's/^/    /'
+  fi
+}
+
+validate_config() {
+  local conf; conf="$(installed_conf)" || { err "nothing installed here"; return 1; }
+  [[ -x "$BIN" ]] || { err "$BIN is missing"; return 1; }
+  title "serai check"
+  "$BIN" check -c "$conf" 2>&1 | sed 's/^/  /'
+}
+
+# diagnose walks the things that actually break a deployment, in the order
+# they break: name resolution, port availability, certificate validity, and
+# finally whether the two halves found each other.
+diagnose() {
+  local conf; conf="$(installed_conf)" || { err "nothing installed here"; return 1; }
+  local unit; unit="$(installed_unit)"
+
+  title "Diagnostics"
+
+  local myip; myip="$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || echo '?')"
+  kv "public ip" "$myip"
+
+  local sni; sni="$(json_field "$conf" tunnel_sni)"
+  if [[ -n "$sni" ]]; then
+    local resolved
+    resolved="$(getent ahostsv4 "$sni" 2>/dev/null | awk 'NR==1{print $1}')"
+    [[ -z "$resolved" ]] && resolved="$(dig +short "$sni" 2>/dev/null | head -1)"
+    if [[ -z "$resolved" ]]; then
+      err "$sni does not resolve"
+    elif [[ "$resolved" == "$myip" ]]; then
+      ok "$sni resolves here ($resolved)"
+    else
+      err "$sni resolves to $resolved, not to this host ($myip)"
+      warn "certbot cannot validate, and users will not reach this relay"
+    fi
+  fi
+
+  printf '\n'
+  local p who
+  for p in 80 443; do
+    who="$(ss -ltnp 2>/dev/null | awk -v P=":$p" '$4 ~ P"$" {print $NF; exit}')"
+    if [[ -z "$who" ]]; then
+      info "tcp/$p free"
+    elif [[ "$who" == *serai* ]]; then
+      ok "tcp/$p held by serai"
+    else
+      warn "tcp/$p held by $who"
+    fi
+  done
+  if ss -lunp 2>/dev/null | grep -q ':443 '; then
+    ok "udp/443 bound (quic)"
+  else
+    info "udp/443 not bound - quic disabled or unavailable"
+  fi
+
+  local cert; cert="$(json_field "$conf" cert_file)"
+  if [[ -n "$cert" && -r "$cert" ]]; then
+    printf '\n'
+    local until days
+    until="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)"
+    days=$(( ( $(date -d "$until" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+    if (( days > 20 )); then
+      ok "certificate valid for $days more days"
+    elif (( days > 0 )); then
+      warn "certificate expires in $days days"
+    else
+      err "certificate is expired or unreadable"
+    fi
+  fi
+
+  printf '\n'
+  local body n
+  body="$(curl -fsS --max-time 3 localhost:9900/status 2>/dev/null)"
+  if [[ -z "$body" ]]; then
+    err "admin endpoint silent - is $unit running?"
+    journalctl -u "$unit" -n 10 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+  else
+    n="$(printf '%s' "$body" | grep -c '"transport"' || true)"
+    if [[ "$n" == 0 ]]; then
+      err "no carriers: this half is up but the two have not paired"
+      warn "check that both sides hold the same key, and that the origin can"
+      warn "reach this host on 443"
+    else
+      ok "$n carrier(s) established"
+    fi
+  fi
+  printf '\n'
+}
+
+do_update() {
+  need_root; require_install || return 1
+  detect_os; ensure_deps; ensure_go
+
+  local unit conf
+  unit="$(installed_unit)"
+  conf="$(installed_conf)"
+
+  build_binary || return 1
+
+  if "$BIN" check -c "$conf" >/dev/null 2>&1; then
+    systemctl restart "$unit" && ok "updated and restarted $unit"
+  else
+    err "the new binary rejects the existing config; not restarting"
+    "$BIN" check -c "$conf" 2>&1 | sed 's/^/    /'
+  fi
+}
+
+rotate_key() {
+  need_root; require_install || return 1
+  [[ -x "$BIN" ]] || { err "$BIN is missing"; return 1; }
+
+  warn "a new key breaks the tunnel until the OTHER server holds the same key."
+  warn "Rotate here first, then paste the new key on the other side."
+  confirm "generate a new pre-shared key?" || { info "cancelled"; return; }
+
+  local new; new="$("$BIN" keygen)"
+  cp -a "$CONF_DIR/psk" "$CONF_DIR/psk.previous" 2>/dev/null || true
+  printf '%s\n' "$new" >"$CONF_DIR/psk"
+  chmod 0600 "$CONF_DIR/psk"
+  systemctl restart "$(installed_unit)"
+
+  rule
+  kv "new key" "$new"
+  kv "previous key kept at" "$CONF_DIR/psk.previous"
+  rule
+  warn "the tunnel stays down until the other server has this key"
+}
+
+service_control() {
+  require_install || return 1
+  local unit; unit="$(installed_unit)"
+  printf '   %s1%s start    %s2%s stop    %s3%s restart\n' \
+    "$C_BOLD$C_TEAL" "$C_RESET" "$C_BOLD$C_TEAL" "$C_RESET" "$C_BOLD$C_TEAL" "$C_RESET"
+  ask SVC "action" "3"
+  case "$SVC" in
+    1) systemctl start "$unit"   && ok "started $unit" ;;
+    2) systemctl stop "$unit"    && ok "stopped $unit" ;;
+    3) systemctl restart "$unit" && ok "restarted $unit" ;;
+    *) err "unknown action" ;;
+  esac
+}
+
+# ───────────────────────────────────────────────────────────────── menu ────
+group() {
+  local dashes=$((W - ${#1} - 3))
+  (( dashes < 0 )) && dashes=0
+  printf '\n  %s%s%s %s%s%s\n' \
+    "$C_BOLD$C_PLUM" "$1" "$C_RESET" \
+    "$C_SLATE" "$(printf '─%.0s' $(seq 1 $dashes))" "$C_RESET"
+}
+
+item() {
+  printf '   %s%2s%s  %-13s %s%s%s\n' \
+    "$C_BOLD$C_TEAL" "$1" "$C_RESET" "$2" "$C_DIM" "$3" "$C_RESET"
+}
+
+danger() {
+  printf '   %s%2s%s  %-13s %s%s%s\n' \
+    "$C_BOLD$C_ROSE" "$1" "$C_RESET" "$2" "$C_DIM" "$3" "$C_RESET"
+}
+
+menu() {
+  local u
+  while true; do
+    banner
+
+    group "install"
+    item 1 "edge"      "relay, in-country - users dial this host"
+    item 2 "origin"    "the host with 3x-ui - dials out, no open port"
+
+    group "operate"
+    item 3 "status"    "carriers, traffic, sessions"
+    item 4 "logs"      "follow the journal"
+    item 5 "service"   "start / stop / restart"
+
+    group "pair and configure"
+    item 6 "pairing"   "key, domain and pin for the other server"
+    item 7 "edit"      "open the config, validated on save"
+    item 8 "validate"  "serai check"
+
+    group "maintain"
+    item   9 "diagnose"   "dns, ports, certificate, carriers"
+    item  10 "tune"       "re-apply kernel tuning"
+    item  11 "update"     "rebuild from source and restart"
+    danger 12 "rotate key" "new pre-shared key - breaks the other side"
+    danger 13 "uninstall"  "remove binary, units and tuning"
+
+    printf '\n'
+    item 0 "quit" ""
+    rule
+    ask CHOICE "choose" ""
+
+    case "$CHOICE" in
+      1)  install_edge ;;
+      2)  install_origin ;;
+      3)  show_status ;;
+      4)  if u="$(installed_unit)"; then journalctl -u "$u" -f; else err "serai is not installed here"; fi ;;
+      5)  service_control ;;
+      6)  show_pairing ;;
+      7)  edit_config ;;
+      8)  validate_config ;;
+      9)  diagnose ;;
+      10) need_root; tune_kernel ;;
+      11) do_update ;;
+      12) rotate_key ;;
+      13) do_uninstall ;;
+      0|q|quit) exit 0 ;;
+      "") continue ;;
+      *)  err "unknown choice '$CHOICE'" ;;
+    esac
+
+    printf '\n  %spress enter to return to the menu%s ' "$C_DIM" "$C_RESET"
+    read -r _ </dev/tty || true
+  done
 }
 
 case "${1:-menu}" in
   edge)      install_edge ;;
   origin)    install_origin ;;
   status)    show_status ;;
+  diagnose)  diagnose ;;
+  pairing)   show_pairing ;;
+  update)    do_update ;;
   tune)      need_root; tune_kernel ;;
   uninstall) do_uninstall ;;
   menu|"")   menu ;;
-  *)         die "unknown command '$1' (edge|origin|status|tune|uninstall)" ;;
+  *)         die "unknown command '$1' (edge|origin|status|diagnose|pairing|update|tune|uninstall)" ;;
 esac
