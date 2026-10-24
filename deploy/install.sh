@@ -662,9 +662,25 @@ install_edge() {
   ask DOMAIN   "tunnel domain (points at this server)"
   if [[ -z "$DOMAIN" ]]; then
     SELF_SIGNED=1
-    info "testing mode: the name below only has to match on both halves,"
-    info "it is never looked up in DNS"
-    ask DOMAIN "name for the self-signed certificate" "tun.internal"
+    info "testing mode: no certificate authority is involved. Still give a"
+    info "name that RESOLVES to this host -- a domain you own, even without a"
+    info "certificate for it. An SNI that resolves nowhere is rejected outright"
+    info "by SNI-filtering middleboxes on some networks, and is a clear signal"
+    info "on any network, which defeats the point of the camouflage."
+    ask DOMAIN "name for the self-signed certificate (should resolve here)"
+    [[ -n "$DOMAIN" ]] || die "a name is required"
+    local resolved
+    resolved="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')"
+    if [[ -z "$resolved" ]]; then
+      warn "$DOMAIN does not resolve. The tunnel may still work, but on a"
+      warn "network that inspects SNI the handshake will be refused with"
+      warn "nothing on either side to explain why."
+      confirm "use it anyway?" || die "point a name at this host and run again"
+    elif [[ "$resolved" != "$(public_ip)" ]]; then
+      warn "$DOMAIN resolves to $resolved, not to this host"
+    else
+      ok "$DOMAIN resolves here"
+    fi
   fi
   ask DECOY    "decoy site to mirror for probers" "https://www.lipsum.com"
   ask WSPATH   "websocket path" "/$(head -c 8 /dev/urandom | base64 | tr -dc 'a-z0-9' | head -c 8)"

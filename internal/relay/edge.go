@@ -73,20 +73,21 @@ func NewEdge(cfg *config.Config, log *slog.Logger) (*Edge, error) {
 		sessions: map[string]*session{},
 		byOrigin: map[string]*session{},
 		sniIndex: map[string]sniRoute{},
+		// No CipherSuites restriction, deliberately.
+		//
+		// An earlier version narrowed this to six AES-GCM suites, reasoning
+		// that AES-NI makes them cheaper per gigabyte than ChaCha20. That
+		// reasoning does not apply: the field is ignored for TLS 1.3, which is
+		// what every client here negotiates, and Go already prefers AES-GCM
+		// when the CPU reports AES-NI. So it bought nothing and cost two
+		// things -- it could only ever turn a working handshake into a
+		// handshake_failure with some client not anticipated here, and a
+		// server offering an unusually narrow cipher list is itself
+		// distinguishable from the ordinary web server this is meant to
+		// resemble.
 		tlsConf: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
-			// Prefer AES-GCM where the CPU has AES-NI: on a small VPS this is
-			// several times cheaper per gigabyte than ChaCha20, and TLS is the
-			// dominant cost in a relay's CPU profile.
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			},
 		},
 	}
 
@@ -179,16 +180,18 @@ func (e *Edge) route(conn net.Conn) {
 	if err != nil && name == "" {
 		if errors.Is(err, sniff.ErrNotTLS) || errors.Is(err, sniff.ErrNoSNI) {
 			// Not TLS, or TLS without SNI: let the decoy answer it.
-			e.serveLocalTLS(peeked)
+			e.log.Debug("no usable sni, serving decoy", "peer", conn.RemoteAddr(), "err", err)
+			e.serveLocalTLSSNI(peeked, "")
 			return
 		}
+		e.log.Debug("could not read client hello", "peer", conn.RemoteAddr(), "err", err)
 		conn.Close()
 		return
 	}
 
 	host := strings.ToLower(strings.TrimSuffix(name, "."))
 	if host == strings.ToLower(e.cfg.Server.TunnelSNI) {
-		e.serveLocalTLS(peeked)
+		e.serveLocalTLSSNI(peeked, host)
 		return
 	}
 
@@ -196,16 +199,18 @@ func (e *Edge) route(conn net.Conn) {
 	route, ok := e.sniIndex[host]
 	e.mu.RUnlock()
 	if !ok {
-		e.serveLocalTLS(peeked)
+		e.log.Debug("sni not routed, serving decoy", "sni", host, "peer", conn.RemoteAddr())
+		e.serveLocalTLSSNI(peeked, host)
 		return
 	}
 
 	e.dispatchTCP(route.sess, route.forward, route.port, peeked)
 }
 
-// serveLocalTLS terminates TLS here and either accepts a tunnel carrier
-// (ALPN) or serves the decoy site (HTTP).
-func (e *Edge) serveLocalTLS(conn net.Conn) {
+// serveLocalTLSSNI terminates TLS here and either accepts a tunnel carrier
+// (ALPN) or serves the decoy site (HTTP). sni is what the client asked for,
+// carried through only so a rejected handshake can be logged against it.
+func (e *Edge) serveLocalTLSSNI(conn net.Conn, sni string) {
 	conf := e.tlsConf.Clone()
 	conf.NextProtos = []string{transport.ALPN, "http/1.1"}
 
@@ -214,9 +219,26 @@ func (e *Edge) serveLocalTLS(conn net.Conn) {
 	err := tconn.HandshakeContext(ctx)
 	cancel()
 	if err != nil {
+		// A failed handshake used to be dropped in silence, on the grounds
+		// that scanners and stray probes are noise. That also made a genuine
+		// configuration fault invisible: the far side reports only "remote
+		// error: handshake failure" and this side logs nothing at all, which
+		// is the least debuggable outcome available. Log it at debug, where
+		// an operator can turn it on without the noise becoming a problem.
+		e.log.Debug("tls handshake rejected",
+			"sni", sni,
+			"peer", conn.RemoteAddr(),
+			"err", err)
 		conn.Close()
 		return
 	}
+
+	st := tconn.ConnectionState()
+	e.log.Debug("tls handshake ok",
+		"sni", st.ServerName,
+		"version", tlsVersionName(st.Version),
+		"alpn", st.NegotiatedProtocol,
+		"peer", conn.RemoteAddr())
 
 	if tconn.ConnectionState().NegotiatedProtocol == transport.ALPN {
 		carrier, err := transport.AcceptMux(tconn, e.cfg.MuxOptions(transport.RoleBoth))
@@ -805,6 +827,21 @@ func (e *Edge) Sessions() map[string][]pool.Stats {
 		out[s.origin] = s.carriers.Snapshot()
 	}
 	return out
+}
+
+func tlsVersionName(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "1.3"
+	case tls.VersionTLS12:
+		return "1.2"
+	case tls.VersionTLS11:
+		return "1.1"
+	case tls.VersionTLS10:
+		return "1.0"
+	default:
+		return fmt.Sprintf("0x%04x", v)
+	}
 }
 
 func newToken() string {
