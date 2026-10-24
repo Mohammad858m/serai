@@ -571,16 +571,18 @@ Description=Serai $role (reverse tunnel)
 Documentation=$REPO_URL
 After=network-online.target
 Wants=network-online.target
+# Do not let a crash loop hammer the relay: a tight reconnect loop is both a
+# load problem and a detectable pattern. These two belong in [Unit]; systemd
+# ignores them in [Service] and only warns about one of them, so the limit
+# silently did not apply.
+StartLimitBurst=20
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
 ExecStart=$BIN $role -c $conf
 Restart=always
 RestartSec=2s
-# Do not let a crash loop hammer the relay: a tight reconnect loop is both a
-# load problem and a detectable pattern.
-StartLimitBurst=20
-StartLimitIntervalSec=300
 
 # Go's garbage collector cannot see the cgroup limit on its own; without this
 # a memory spike is an OOM kill instead of a collection.
@@ -754,6 +756,7 @@ CONF
   printf '%s  Edge is live. Paste this into the origin installer.%s\n' "$C_BOLD$C_MINT" "$C_RESET"
   rule
   kv "tunnel name"    "$DOMAIN"
+  kv "profile"        "$PROFILE  (the origin MUST use this same profile)"
   kv "relay address"  "$(public_ip):443"
   kv "websocket path" "$WSPATH"
   kv "allowed ports"  "$ALLOW  (plus 443 via SNI)"
@@ -793,7 +796,14 @@ install_origin() {
   info "if the relay uses a self-signed certificate, paste the pin the edge"
   info "installer printed. Leave blank when the relay has a real certificate."
   ask PIN     "certificate pin (sha256/...)" ""
-  ask PROFILE "profile (speed / balanced / stealth)" "balanced"
+  printf '
+'
+  warn "the profile must match the relay's exactly. It decides whether the"
+  warn "connection is wrapped in the shaping layer, and that is applied before"
+  warn "the handshake with nothing to negotiate it -- so a mismatch fails with"
+  warn "no useful error on either side. Use the value the edge installer"
+  warn "printed under \"profile\"."
+  ask PROFILE "profile, as shown by the edge installer" "balanced"
   printf '\n'
   info "now the forwarding rules. The relay opens these ports; a user who"
   info "connects to them reaches the matching local port on this host."
@@ -1027,6 +1037,8 @@ show_pairing() {
   ws="$(json_field "$conf" ws_path)"
   cert="$(json_field "$conf" cert_file)"
   [[ -n "$sni" ]] && kv "tunnel domain" "$sni"
+  kv "profile" "$(json_field "$conf" profile)  (both halves must match)"
+  kv "relay address" "$(public_ip):443"
   [[ -n "$ws" ]]  && kv "websocket path" "$ws"
   if [[ -n "$cert" && -r "$cert" && -x "$BIN" ]]; then
     kv "certificate pin" "$("$BIN" pin -cert "$cert" 2>/dev/null || echo '(unreadable)')"
