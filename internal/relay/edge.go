@@ -443,6 +443,16 @@ func (e *Edge) register(reg protocol.Register, c transport.Carrier) (*session, b
 	}
 
 	for _, f := range reg.Forwards {
+		// The origin sends the spec, not the expanded list; expand it here.
+		ports, err := f.ExpandPorts()
+		if err != nil {
+			reply.Rejected = append(reply.Rejected, protocol.Rejected{
+				Name: f.Name, Ports: f.EdgePorts, Reason: err.Error(),
+			})
+			continue
+		}
+		f.Ports = ports
+
 		acc, rej := s.bind(ctx, f)
 		if rej != nil {
 			reply.Rejected = append(reply.Rejected, *rej)
@@ -472,8 +482,12 @@ func (e *Edge) register(reg protocol.Register, c transport.Carrier) (*session, b
 // bind opens the listeners for one rule, reporting what was accepted.
 func (s *session) bind(ctx context.Context, f protocol.Forward) (*protocol.Accepted, *protocol.Rejected) {
 	e := s.edge
-	reject := func(reason string, ports []int) (*protocol.Accepted, *protocol.Rejected) {
-		return nil, &protocol.Rejected{Name: f.Name, Ports: ports, Reason: reason}
+	reject := func(reason string, port int) (*protocol.Accepted, *protocol.Rejected) {
+		return nil, &protocol.Rejected{
+			Name:   f.Name,
+			Ports:  strconv.Itoa(port),
+			Reason: reason,
+		}
 	}
 
 	controlPort := portOf(e.cfg.Server.ControlAddr)
@@ -491,33 +505,38 @@ func (s *session) bind(ctx context.Context, f protocol.Forward) (*protocol.Accep
 		// rebind the relay's own listener.
 		if p == controlPort {
 			if len(f.SNI) == 0 {
-				return reject(fmt.Sprintf("port %d is the relay's own port; give this rule an \"sni\" so it can share it", p), []int{p})
+				return reject(fmt.Sprintf("port %d is the relay's own port; give this rule an \"sni\" so it can share it", p), p)
 			}
 			bound = append(bound, p)
 			continue
 		}
 
-		if !config.PortAllowed(e.cfg.Server.AllowPorts, p) {
+		if !protocol.PortAllowed(e.cfg.Server.AllowPorts, p) {
 			return reject(fmt.Sprintf("port %d is outside server.allow_ports (%s)",
-				p, e.cfg.Server.AllowPorts), []int{p})
+				p, e.cfg.Server.AllowPorts), p)
 		}
 		if f.WantsTCP() {
 			if err := s.listenTCP(ctx, f.Name, p); err != nil {
-				return reject(fmt.Sprintf("tcp/%d: %v", p, err), []int{p})
+				return reject(fmt.Sprintf("tcp/%d: %v", p, err), p)
 			}
 		}
 		if f.WantsUDP() {
 			if p == quicPort {
-				return reject(fmt.Sprintf("udp/%d collides with the relay's QUIC port", p), []int{p})
+				return reject(fmt.Sprintf("udp/%d collides with the relay's QUIC port", p), p)
 			}
 			if err := s.listenUDP(ctx, f.Name, p); err != nil {
-				return reject(fmt.Sprintf("udp/%d: %v", p, err), []int{p})
+				return reject(fmt.Sprintf("udp/%d: %v", p, err), p)
 			}
 		}
 		bound = append(bound, p)
 	}
 
-	return &protocol.Accepted{Name: f.Name, Proto: f.Proto, Ports: bound}, nil
+	return &protocol.Accepted{
+		Name:  f.Name,
+		Proto: f.Proto,
+		Ports: f.EdgePorts,
+		Count: len(bound),
+	}, nil
 }
 
 func (s *session) listenTCP(ctx context.Context, forward string, port int) error {
@@ -714,7 +733,12 @@ func (s *session) acceptedList() []protocol.Accepted {
 	defer s.mu.Unlock()
 	out := make([]protocol.Accepted, 0, len(s.forwards))
 	for _, f := range s.forwards {
-		out = append(out, protocol.Accepted{Name: f.Name, Proto: f.Proto, Ports: f.Ports})
+		out = append(out, protocol.Accepted{
+			Name:  f.Name,
+			Proto: f.Proto,
+			Ports: f.EdgePorts,
+			Count: len(f.Ports),
+		})
 	}
 	return out
 }

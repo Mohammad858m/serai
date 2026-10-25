@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -432,10 +431,10 @@ func (o *Origin) connect(ctx context.Context, c *candidate) error {
 		"carriers", o.set.Len(),
 	)
 	for _, a := range done.Accepted {
-		o.log.Info("forward live", "name", a.Name, "proto", a.Proto, "ports", summarisePorts(a.Ports))
+		o.log.Info("forward live", "name", a.Name, "proto", a.Proto, "ports", a.Ports, "count", a.Count)
 	}
 	for _, r := range done.Rejected {
-		o.log.Error("forward refused", "name", r.Name, "ports", summarisePorts(r.Ports), "reason", r.Reason)
+		o.log.Error("forward refused", "name", r.Name, "ports", r.Ports, "reason", r.Reason)
 	}
 
 	go o.runControl(ctrl, carrier, entry)
@@ -684,16 +683,3 @@ func setPort(ap netip.AddrPort, port uint16) netip.AddrPort {
 	return netip.AddrPortFrom(ap.Addr(), port)
 }
 
-func summarisePorts(ports []int) string {
-	if len(ports) == 0 {
-		return "-"
-	}
-	if len(ports) <= 6 {
-		parts := make([]string, len(ports))
-		for i, p := range ports {
-			parts[i] = fmt.Sprint(p)
-		}
-		return strings.Join(parts, ",")
-	}
-	return fmt.Sprintf("%d-%d (%d ports)", ports[0], ports[len(ports)-1], len(ports))
-}

@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -537,71 +536,9 @@ func Duration(s string, fallback time.Duration) time.Duration {
 	return d
 }
 
-// ParsePorts expands "443,8443,20000-20100" into a sorted, de-duplicated list.
-// Ranges are what make this usable with a panel: add an inbound on any port in
-// the range and it is already reachable, with no change on either server.
-func ParsePorts(spec string) ([]int, error) {
-	spec = strings.TrimSpace(spec)
-	if spec == "" {
-		return nil, nil
-	}
-
-	set := map[int]bool{}
-	for _, part := range strings.Split(spec, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		lo, hi, isRange := strings.Cut(part, "-")
-		a, err := parsePort(lo)
-		if err != nil {
-			return nil, err
-		}
-		b := a
-		if isRange {
-			if b, err = parsePort(hi); err != nil {
-				return nil, err
-			}
-		}
-		if b < a {
-			a, b = b, a
-		}
-		if b-a > 20000 {
-			return nil, fmt.Errorf("range %s covers %d ports; that is almost certainly a mistake", part, b-a+1)
-		}
-		for p := a; p <= b; p++ {
-			set[p] = true
-		}
-	}
-
-	out := make([]int, 0, len(set))
-	for p := range set {
-		out = append(out, p)
-	}
-	sort.Ints(out)
-	return out, nil
-}
-
-func parsePort(s string) (int, error) {
-	n, err := strconv.Atoi(strings.TrimSpace(s))
-	if err != nil {
-		return 0, fmt.Errorf("%q is not a port number", s)
-	}
-	if n < 1 || n > 65535 {
-		return 0, fmt.Errorf("port %d out of range", n)
-	}
-	return n, nil
-}
+// ParsePorts and PortAllowed delegate to the protocol package, which owns them
+// because both halves of the tunnel expand the same spec independently.
+func ParsePorts(spec string) ([]int, error) { return protocol.ParsePorts(spec) }
 
 // PortAllowed reports whether p is within spec. An empty spec allows all.
-func PortAllowed(spec string, p int) bool {
-	if strings.TrimSpace(spec) == "" {
-		return true
-	}
-	ports, err := ParsePorts(spec)
-	if err != nil {
-		return false
-	}
-	i := sort.SearchInts(ports, p)
-	return i < len(ports) && ports[i] == p
-}
+func PortAllowed(spec string, p int) bool { return protocol.PortAllowed(spec, p) }

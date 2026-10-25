@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -46,8 +48,13 @@ type Forward struct {
 	// single ports and inclusive ranges, e.g. "443,8443,20000-20100".
 	EdgePorts string `json:"edge_ports"`
 
-	// Ports is the expanded, validated form of EdgePorts.
-	Ports []int `json:"ports,omitempty"`
+	// Ports is the expanded form of EdgePorts, and is deliberately NOT sent on
+	// the wire: both halves can expand the spec themselves, and shipping the
+	// list made the handshake enormous. A single "8000-9000" became a thousand
+	// integers, about six kilobytes, and the installer's own default spanned
+	// eleven thousand ports -- past the handshake payload limit entirely. Every
+	// deployment that accepted the default was guaranteed to fail.
+	Ports []int `json:"-"`
 
 	// SNI lists hostnames that route to this rule on the edge's shared 443.
 	// Using SNI instead of a dedicated port is what keeps the relay down to a
@@ -70,6 +77,11 @@ type Forward struct {
 	TargetHost string `json:"target_host,omitempty"`
 }
 
+// ExpandPorts parses EdgePorts into the port list this rule covers.
+func (f Forward) ExpandPorts() ([]int, error) {
+	return ParsePorts(f.EdgePorts)
+}
+
 // Public returns the rule as the edge should see it: no backend addresses.
 //
 // The edge quotes a rule name and a port back to the origin, and the origin
@@ -79,6 +91,7 @@ type Forward struct {
 func (f Forward) Public() Forward {
 	f.Target = ""
 	f.TargetHost = ""
+	f.Ports = nil
 	return f
 }
 
@@ -122,17 +135,19 @@ type Register struct {
 	Join string `json:"join,omitempty"`
 }
 
-// Accepted reports one rule the edge actually bound.
+// Accepted reports one rule the edge actually bound. The ports are reported as
+// the spec plus a count rather than a list, for the reason given on Forward.Ports.
 type Accepted struct {
 	Name  string `json:"name"`
 	Proto string `json:"proto"`
-	Ports []int  `json:"ports"`
+	Ports string `json:"ports"`
+	Count int    `json:"count"`
 }
 
 // Rejected reports one rule the edge refused, with a human-readable reason.
 type Rejected struct {
 	Name   string `json:"name"`
-	Ports  []int  `json:"ports,omitempty"`
+	Ports  string `json:"ports,omitempty"`
 	Reason string `json:"reason"`
 }
 
@@ -226,3 +241,75 @@ func (c *Codec) Write(v any) error {
 
 // Now returns the current time in the units used by Control.TS.
 func Now() int64 { return time.Now().UnixMilli() }
+
+// ParsePorts expands "443,8443,20000-20100" into a sorted, de-duplicated list.
+// Ranges are what make this usable with a panel: add an inbound on any port in
+// the range and it is already reachable, with no change on either server.
+//
+// It lives here rather than in the config package because both halves need it:
+// the spec travels on the wire, and each side expands it locally.
+func ParsePorts(spec string) ([]int, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, nil
+	}
+
+	set := map[int]bool{}
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		lo, hi, isRange := strings.Cut(part, "-")
+		a, err := parsePort(lo)
+		if err != nil {
+			return nil, err
+		}
+		b := a
+		if isRange {
+			if b, err = parsePort(hi); err != nil {
+				return nil, err
+			}
+		}
+		if b < a {
+			a, b = b, a
+		}
+		if b-a > 20000 {
+			return nil, fmt.Errorf("range %s covers %d ports; that is almost certainly a mistake", part, b-a+1)
+		}
+		for p := a; p <= b; p++ {
+			set[p] = true
+		}
+	}
+
+	out := make([]int, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+func parsePort(s string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a port number", s)
+	}
+	if n < 1 || n > 65535 {
+		return 0, fmt.Errorf("port %d out of range", n)
+	}
+	return n, nil
+}
+
+// PortAllowed reports whether p is within spec. An empty spec allows all.
+func PortAllowed(spec string, p int) bool {
+	if strings.TrimSpace(spec) == "" {
+		return true
+	}
+	ports, err := ParsePorts(spec)
+	if err != nil {
+		return false
+	}
+	i := sort.SearchInts(ports, p)
+	return i < len(ports) && ports[i] == p
+}
