@@ -119,7 +119,7 @@ cat >"$WORK/edge.json" <<EOF
     "ws_path": "/selftest",
     "cert_file": "$WORK/cert.pem",
     "key_file": "$WORK/key.pem",
-    "allow_ports": "18000-19000"
+    "allow_ports": "17000-19000"
   }
 }
 EOF
@@ -145,7 +145,10 @@ cat >"$WORK/origin.json" <<EOF
   "tuning": { "carriers": 2 },
   "forwards": [
     { "name": "wide", "proto": "tcp", "edge_ports": "18000-19000",
-      "target_host": "127.0.0.1" }
+      "target_host": "127.0.0.1" },
+    { "name": "echo-lo", "proto": "tcp", "edge_ports": "17001", "target": "127.0.0.1:19099" },
+    { "name": "echo-mid", "proto": "tcp", "edge_ports": "17500", "target": "127.0.0.1:19099" },
+    { "name": "echo-hi", "proto": "tcp", "edge_ports": "17999", "target": "127.0.0.1:19099" }
   ]
 }
 EOF
@@ -155,7 +158,14 @@ for f in edge origin; do
     bad "$f config rejected"; cat "$WORK/$f.check"; exit 1
   }
 done
-ok "both configs valid, 1001 forwarded ports"
+ok "both configs valid, 1001 forwarded ports plus three echo probes"
+
+# Why the round trip does not use the wide range: "target_host" keeps the port,
+# so edge:18000 would dial 127.0.0.1:18000 on the origin -- and with both
+# halves on one host that is the relay's own listener, which loops. On a real
+# deployment the two are different machines and 127.0.0.1:18000 is the panel.
+# The wide range is still checked for correct binding below; the echo probes
+# use fixed targets so they reach the backend instead of coming back round.
 
 # ──────────────────────────────────────────────────────────────── run them ───
 step "Tunnel"
@@ -214,11 +224,21 @@ sys.stdout.write(out.decode("utf-8", "replace"))
 
 # Before blaming the datapath, confirm the relay actually bound the ports.
 # "no round trip" otherwise covers both an unbound port and a broken relay.
+# The ends and the middle of the wide range: a fault in range expansion almost
+# always leaves exactly one end unbound.
 bound="$(ss -ltn 2>/dev/null | awk '{print $4}' | grep -cE ':(18000|18500|19000)$' || true)"
 if [[ "$bound" -eq 3 ]]; then
-  ok "all three probe ports are listening"
+  ok "wide range bound at both ends and the middle"
 else
-  bad "only $bound of 3 probe ports are listening - the relay did not bind them"
+  bad "only $bound of 3 range ports are listening - range expansion is wrong"
+  FAILED=1
+fi
+
+probes="$(ss -ltn 2>/dev/null | awk '{print $4}' | grep -cE ':(17001|17500|17999)$' || true)"
+if [[ "$probes" -eq 3 ]]; then
+  ok "all three echo probes are listening"
+else
+  bad "only $probes of 3 echo probes are listening"
   FAILED=1
 fi
 
@@ -238,7 +258,7 @@ fi
 
 # First, last and middle of the range: a fault in range expansion usually
 # leaves exactly one end unbound.
-for port in 18000 18500 19000; do
+for port in 17001 17500 17999; do
   if check_port "$port"; then
     ok "port $port: data out and back"
   else
@@ -254,7 +274,7 @@ bulk_sent="$(head -c 200000 /dev/urandom | base64 -w0)"
 bulk_got="$(printf '%s' "$bulk_sent" | timeout 20 python3 -c '
 import socket, sys
 data = sys.stdin.buffer.read()
-s = socket.create_connection(("127.0.0.1", 18250), timeout=15)
+s = socket.create_connection(("127.0.0.1", 17500), timeout=15)
 s.sendall(data)
 out = b""
 while len(out) < len(data):
