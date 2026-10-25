@@ -226,6 +226,30 @@ func (c *Codec) Read(v any) error {
 	return json.Unmarshal(line, v)
 }
 
+// Buffered returns the bytes the decoder read past the end of the last message
+// and has not handed back yet.
+//
+// This matters because of how a data stream opens. The relay writes the open
+// request and the user's first bytes together, without waiting for a reply --
+// that is what keeps the tunnel from adding a round trip. Both therefore tend
+// to arrive in one read, and this decoder buffers in 8 KiB blocks, so the
+// user's opening bytes end up sitting in that buffer. Anything that goes on to
+// read the stream directly has to be handed them first, or they are simply
+// lost: the backend sees a connection that opens and then says nothing.
+func (c *Codec) Buffered() []byte {
+	n := c.r.Buffered()
+	if n == 0 {
+		return nil
+	}
+	b, err := c.r.Peek(n)
+	if err != nil {
+		return nil
+	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
 // Write encodes v as a single JSON line.
 func (c *Codec) Write(v any) error {
 	b, err := json.Marshal(v)

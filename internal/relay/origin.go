@@ -1,11 +1,13 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net"
@@ -561,6 +563,13 @@ func (o *Origin) serveStream(st transport.Stream, e *pool.Entry) {
 	}
 	_ = st.SetReadDeadline(time.Time{})
 
+	// Re-attach whatever the decoder buffered past the open request: those are
+	// the user's first bytes, sent alongside the header to save a round trip.
+	var data transport.Stream = st
+	if pre := codec.Buffered(); len(pre) > 0 {
+		data = &prefixedStream{Stream: st, r: io.MultiReader(bytes.NewReader(pre), st)}
+	}
+
 	f, ok := o.forwards[req.Forward]
 	if !ok {
 		o.log.Warn("relay asked for an unknown forward", "name", req.Forward)
@@ -574,11 +583,20 @@ func (o *Origin) serveStream(st transport.Stream, e *pool.Entry) {
 
 	switch req.Proto {
 	case protocol.ProtoUDP:
-		o.serveUDP(st, f, req, target, e)
+		o.serveUDP(data, f, req, target, e)
 	default:
-		o.serveTCP(st, f, req, target, e)
+		o.serveTCP(data, f, req, target, e)
 	}
 }
+
+// prefixedStream is a Stream whose reads begin with bytes already consumed
+// elsewhere. Writes, deadlines and Close go to the real stream unchanged.
+type prefixedStream struct {
+	transport.Stream
+	r io.Reader
+}
+
+func (p *prefixedStream) Read(b []byte) (int, error) { return p.r.Read(b) }
 
 func (o *Origin) serveTCP(st transport.Stream, f protocol.Forward, req protocol.OpenRequest, target string, e *pool.Entry) {
 	d := net.Dialer{Timeout: 10 * time.Second}
