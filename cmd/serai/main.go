@@ -158,10 +158,20 @@ func check(args []string) error {
 	fmt.Printf("name      %s\n", cfg.Name)
 	fmt.Printf("profile   %s\n", cfg.Profile)
 	fmt.Printf("shaping   %s\n", cfg.Obfs.Scope)
-	fmt.Printf("carriers  %d\n", cfg.Tuning.Carriers)
 	fmt.Printf("window    %d KiB per stream, max %d streams per carrier\n",
 		cfg.Tuning.StreamWindow/1024, cfg.Tuning.MaxStreams)
-	fmt.Printf("memory    %d MiB worst case buffered\n", cfg.MemoryCeiling()/(1<<20))
+
+	// carriers, and the ceiling derived from it, are dialer-side only. The
+	// relay does not choose how many carriers exist -- the origin does -- so
+	// printing its own value invited tuning a field with no effect there, and
+	// the total computed from it was simply wrong for that half.
+	if cfg.Role == config.RoleOrigin {
+		fmt.Printf("carriers  %d\n", cfg.Tuning.Carriers)
+		fmt.Printf("memory    %d MiB worst case buffered\n", cfg.MemoryCeiling()/(1<<20))
+	} else {
+		fmt.Printf("memory    %d MiB per carrier, worst case\n",
+			int64(cfg.Tuning.StreamWindow)*int64(cfg.Tuning.MaxStreams)/(1<<20))
+	}
 
 	if cfg.Role == config.RoleOrigin {
 		fmt.Printf("\npaths\n")
