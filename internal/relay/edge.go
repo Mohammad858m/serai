@@ -551,6 +551,8 @@ func (s *session) listenTCP(ctx context.Context, forward string, port int) error
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
+				s.edge.log.Debug("forward listener stopped",
+					"forward", forward, "port", port, "err", err)
 				return
 			}
 			tuneTCP(conn)
@@ -570,6 +572,8 @@ func (s *session) listenTCP(ctx context.Context, forward string, port int) error
 func (e *Edge) dispatchTCP(s *session, forward string, port int, conn net.Conn) {
 	defer conn.Close()
 
+	e.log.Debug("user connection", "forward", forward, "port", port, "client", conn.RemoteAddr())
+
 	st, entry, release, err := s.carriers.OpenStream(context.Background(), transport.RoleData)
 	if err != nil {
 		e.log.Warn("no carrier for user connection",
@@ -586,11 +590,17 @@ func (e *Edge) dispatchTCP(s *session, forward string, port int, conn net.Conn) 
 		Client:  conn.RemoteAddr().String(),
 	}
 	if err := protocol.NewCodec(st).Write(req); err != nil {
+		// Previously silent, which made a dead carrier look identical to a
+		// backend that simply never answered.
+		e.log.Warn("could not send open request",
+			"forward", forward, "port", port, "transport", entry.Carrier.Transport(), "err", err)
 		return
 	}
 
 	in, out := Splice(st, conn, e.cfg.Tuning.CopyBuffer)
 	entry.AddTraffic(uint64(out), uint64(in))
+	e.log.Debug("user connection closed",
+		"forward", forward, "port", port, "to_origin", out, "to_client", in)
 }
 
 // --- UDP ---------------------------------------------------------------------

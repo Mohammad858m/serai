@@ -559,6 +559,7 @@ func (o *Origin) serveStream(st transport.Stream, e *pool.Entry) {
 	var req protocol.OpenRequest
 	_ = st.SetReadDeadline(time.Now().Add(15 * time.Second))
 	if err := codec.Read(&req); err != nil {
+		o.log.Debug("could not read open request", "err", err)
 		return
 	}
 	_ = st.SetReadDeadline(time.Time{})
@@ -569,6 +570,9 @@ func (o *Origin) serveStream(st transport.Stream, e *pool.Entry) {
 	if pre := codec.Buffered(); len(pre) > 0 {
 		data = &prefixedStream{Stream: st, r: io.MultiReader(bytes.NewReader(pre), st)}
 	}
+
+	o.log.Debug("stream opened by relay",
+		"forward", req.Forward, "proto", req.Proto, "port", req.Port, "client", req.Client)
 
 	f, ok := o.forwards[req.Forward]
 	if !ok {
@@ -617,6 +621,8 @@ func (o *Origin) serveTCP(st transport.Stream, f protocol.Forward, req protocol.
 
 	in, out := Splice(st, backend, o.cfg.Tuning.CopyBuffer)
 	e.AddTraffic(uint64(in), uint64(out))
+	o.log.Debug("backend connection closed",
+		"forward", f.Name, "target", target, "to_backend", in, "to_relay", out)
 }
 
 // serveUDP bridges a framed stream to a UDP socket aimed at the backend. One

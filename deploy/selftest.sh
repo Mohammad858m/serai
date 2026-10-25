@@ -212,6 +212,30 @@ sys.stdout.write(out.decode("utf-8", "replace"))
   [[ "$got" == "$sent" ]]
 }
 
+# Before blaming the datapath, confirm the relay actually bound the ports.
+# "no round trip" otherwise covers both an unbound port and a broken relay.
+bound="$(ss -ltn 2>/dev/null | awk '{print $4}' | grep -cE ':(18000|18500|19000)$' || true)"
+if [[ "$bound" -eq 3 ]]; then
+  ok "all three probe ports are listening"
+else
+  bad "only $bound of 3 probe ports are listening - the relay did not bind them"
+  FAILED=1
+fi
+
+# Sanity-check the backend itself, so a broken echo server cannot masquerade
+# as a broken tunnel.
+if printf 'ping' | timeout 5 python3 -c '
+import socket,sys
+d=sys.stdin.buffer.read()
+s=socket.create_connection(("127.0.0.1",19099),timeout=4)
+s.sendall(d); sys.stdout.write(s.recv(64).decode()); s.close()
+' 2>/dev/null | grep -q ping; then
+  ok "echo backend answers directly"
+else
+  bad "echo backend does not answer directly - the test fixture is broken"
+  FAILED=1
+fi
+
 # First, last and middle of the range: a fault in range expansion usually
 # leaves exactly one end unbound.
 for port in 18000 18500 19000; do
